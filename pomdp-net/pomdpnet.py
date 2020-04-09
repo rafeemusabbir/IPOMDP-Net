@@ -3,7 +3,7 @@ import tensorflow as tf
 import numpy as np
 
 
-class IPOMDPNet:
+class POMDPNet:
     """
 
     """

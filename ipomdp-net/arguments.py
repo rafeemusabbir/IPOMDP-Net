@@ -21,6 +21,11 @@ def parse_args(arglist):
                         nargs='*',
                         help='Load model weights from checkpoint')
 
+    parser.add_argument('--num_sample',
+                        default=1000,
+                        help='Number of particles to keep fixed during'
+                             'the particle (interactive) filtering.')
+
     parser.add_argument('--eval_samples',
                         type=int,
                         default=100,

@@ -244,7 +244,7 @@ class TigerGridBase(object):
                  traj_len, failed], 'i')
 
             db.root.samples.append(sample[None])
-            db.root.bs.append(np.array(beliefs[:1]))
+            db.root.bs.append(np.array(beliefs[:1]))  # only picks init_beliefs
             db.root.expRs.append([reward_sum])
             db.root.steps.append(step)
 

@@ -24,7 +24,7 @@ def conv_layer(input_data,
     :param dtype: the data type of the kernel weights
     :param add_bias: whether adding bias in convolutional layer or not
     :param strides: the convolutional strides, match TF
-    :param padding: the padding, match TF
+    :param padding: the padding type, match TF
     :return: (tensor) output
     """
     input_size = int(input_data.get_shape()[3])
@@ -72,10 +72,7 @@ def linear_layer(input_data,
     :param dtype
     :return: (tensor) output
     """
-    input_size = 1
-
-    if len(input_data.get_shape().as_list()) > 1:
-        input_size = input_data.get_shape().as_list()[1]
+    input_size = input_data.get_shape().as_list()[1]
 
     if w_std is None:
         w_std = 1.0 / np.sqrt(float(np.prod(input_size)))
@@ -127,11 +124,11 @@ def conv_layers(input_data, conv_params, names, **kwargs):
     return output
 
 
-def fc_layers(input_data, fc_params, names, **kwargs):
+def fc_layers(input_data, fc_params, names=None, **kwargs):
     """
 
     :param input_data:
-    :param conv_params:
+    :param fc_params:
     :param names:
     :param kwargs:
     :return:
