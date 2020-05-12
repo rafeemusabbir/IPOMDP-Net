@@ -67,7 +67,8 @@ class TigerGridBase(object):
         self.gold_cell = None
         self.tiger_cell = None
 
-    def simulate_policy(self, policy, grid, l0_b0, ib0, init_phys_state,
+    def simulate_policy(self, policy, grid, terminals,
+                        l0_b0, ib0, init_phys_state,
                         first_action=None, level=1):
         params = self.params
         max_traj_len = params.traj_limit
@@ -98,10 +99,11 @@ class TigerGridBase(object):
 
         # Initialize the policy.
         env_img = grid[None]
+        terminal_img = terminals[None]
         assert ib0.shape[0] == self.num_inter_phys_state
         ib0 = np.array(
             [[np.append(s, l0_b0), ib0[s]] for s in np.arange(ib0.shape[0])])
-        policy.reset(env_img, ib0)
+        policy.reset(env_img, terminal_img, ib0)
 
         act_self = act_other = first_action
         act_joint_self = joint_to_lin(

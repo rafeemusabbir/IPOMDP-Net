@@ -103,7 +103,7 @@ class DataFeed:
         filtered_samples = np.stack((
             sample_indices,  # sample_id
             samples[:, 0],  # env_i
-            samples[:, 1],  # terminal_map
+            samples[:, 1],  # terminal_i
             samples[:, 2],  # step_i
             arr_traj_len,  # processed arr_traj_len
         ), axis=1)
@@ -316,11 +316,12 @@ class EvalDataFeed(dataflow.ProxyDataFlow):
         for evaluated policy.
         fields: success rate, trajectory length, accumulated reward
         """
-        sample_i, env_i, terminals, step_i, _ = [np.atleast_1d(x.squeeze())
-                                                 for x in np.split(
-                sample, sample.shape[0], axis=0)]
+        sample_i, env_i, terminal_i, step_i, _ = \
+            [np.atleast_1d(x.squeeze())
+             for x in np.split(sample, sample.shape[0], axis=0)]
 
         env = self.db.envs[env_i[0]]
+        terminals = self.db.terminals[terminal_i[0]]
         b0 = self.db.l0_bs[sample_i[0]]
         ib0 = self.db.inter_bs[sample_i[0]]
         db_sample = self.db.samples[sample_i[0]]
@@ -343,6 +344,7 @@ class EvalDataFeed(dataflow.ProxyDataFlow):
                 self.domain.simulate_policy(
                     policy=self.policy,
                     grid=env,
+                    terminals=terminals,
                     l0_b0=b0,
                     ib0=ib0,
                     init_phys_state=phys_state_self_lin,
