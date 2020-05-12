@@ -1,21 +1,33 @@
 import numpy as np
+import scipy.sparse
+import mdptoolbox
 
 
 class IParticleFilter:
-    def __init__(self, trans_func, reward_func, obs_func, params):
-        self.trans_func = trans_func
-        self.obs_func = obs_func
-        self.reward_func = reward_func
+    def __init__(self, params):
+        self.l0_trans_func = None
+        self.l0_obs_func = None
+        self.l0_reward_func = None
+        self.inter_trans_func = None
+        self.inter_obs_func = None
+        self.inter_reward_func = None
+
+        self.sub_q_val = None
+        self.sub_val = None
+        self.ob_q_val = None
+        self.ob_val = None
 
         self.agent_loc_space = params.agent_loc_space
         self.door_loc_space = params.door_loc_space
 
-        self.phys_state_space = params.phys_state_space
+        self.l0_phys_state_space = params.l0_phys_state_space
+        self.inter_phys_state_space = params.inter_phys_state_space
         self.act_space = params.action_space
         self.joint_act_space = params.joint_action_space
         self.obs_space = params.obs_space
 
-        self.num_phys_state = params.num_phys_state
+        self.num_l0_phys_state = params.num_l0_phys_state
+        self.num_inter_phys_state = params.num_inter_phys_state
         self.num_action = params.num_action
         self.num_joint_action = params.num_joint_action
         self.num_obs = params.num_obs
@@ -23,11 +35,134 @@ class IParticleFilter:
         self.num_particle = params.num_particle_pf
         self.discount = params.discount
 
+        self.agent_level = params.agent_level
+
         self.params = params
 
         self.count = 0
 
-    def particle_sampling(self, dist, particle_size):
+        self.issparse = False
+
+    def solve_qmdp(self):
+        self.solve_ob_agent()
+        self.solve_sub_agent()
+
+    def solve_sub_agent(self):
+        self.compute_val(agent_level=self.agent_level, is_self=True)
+        self.compute_q_val(agent_level=self.agent_level, is_self=True)
+
+    def solve_ob_agent(self):
+        self.compute_val(agent_level=self.agent_level - 1, is_self=False)
+        self.compute_q_val(agent_level=self.agent_level - 1, is_self=False)
+
+    def compute_val(self, agent_level, is_self, max_iter=1e4):
+        if not agent_level:
+            vi = mdptoolbox.mdp.ValueIteration(
+                transitions=self.l0_trans_func,
+                reward=self.l0_reward_func,
+                discount=self.discount,
+                max_iter=max_iter,
+                skip_check=True)
+        else:
+            vi = mdptoolbox.mdp.ValueIteration(
+                transitions=self.inter_trans_func,
+                reward=self.inter_reward_func,
+                discount=self.discount,
+                max_iter=max_iter,
+                skip_check=True)
+
+        vi.run()
+        assert vi.iter < max_iter
+
+        if is_self:
+            self.sub_val = vi.V
+        else:
+            self.ob_val = vi.V
+
+    def compute_q_val(self, agent_level, is_self):
+        self.sub_q_val = np.zeros(
+            (self.num_inter_phys_state, self.num_joint_action))
+        if not agent_level:
+            self.ob_q_val = np.zeros(
+                (self.num_l0_phys_state, self.num_joint_action))
+            for act_joint_lin in range(self.num_joint_action):
+                if self.issparse:
+                    reward = np.array(
+                        self.l0_trans_func[act_joint_lin].multiply(
+                        self.l0_reward_func[act_joint_lin]).sum(1)).squeeze()
+                else:
+                    reward = self.l0_trans_func[act_joint_lin].multiply(
+                        self.l0_reward_func[act_joint_lin]).sum(1)
+                self.ob_q_val[:, act_joint_lin] = \
+                    reward + self.discount *\
+                    self.l0_trans_func[act_joint_lin].dot(self.ob_val)
+        else:
+            if is_self:
+                for act_joint_lin in range(self.num_joint_action):
+                    if self.issparse:
+                        reward = np.array(
+                            self.inter_trans_func[act_joint_lin].multiply(
+                            self.inter_reward_func[act_joint_lin]).sum(1)).squeeze()
+                    else:
+                        reward = self.inter_trans_func[act_joint_lin].multiply(
+                            self.inter_reward_func[act_joint_lin]).sum(1)
+                    self.sub_q_val[:, act_joint_lin] = \
+                        reward + self.discount *\
+                        self.inter_trans_func[act_joint_lin].dot(self.sub_val)
+            else:
+                self.ob_q_val = np.zeros(
+                    (self.num_inter_phys_state, self.num_joint_action))
+                for act_joint_lin in range(self.num_joint_action):
+                    if self.issparse:
+                        reward = np.array(
+                            self.inter_trans_func[act_joint_lin].multiply(
+                            self.inter_reward_func[act_joint_lin]).sum(1)).squeeze()
+                    else:
+                        reward = self.inter_trans_func[act_joint_lin].multiply(
+                        self.inter_reward_func[act_joint_lin]).sum(1)
+                    self.ob_q_val[:, act_joint_lin] = \
+                        reward + self.discount *\
+                        self.inter_trans_func[act_joint_lin].dot(self.ob_val)
+
+    def qmdp_policy(self, belief, agent_level, is_self):
+        belief = np.array(belief)
+        if not agent_level:
+            q_val_sum = np.dot(belief, self.ob_q_val)
+            q_val_sum_self = list()
+            for a_self in self.act_space:
+                a_joint = [[a_self, a_other] for a_other in self.act_space]
+                a_joint_lin = [joint_to_lin(
+                    a, (self.act_space, self.act_space)) for a in a_joint]
+                q_val_sum_self.append(np.mean(q_val_sum[a_joint_lin]))
+            q_val_sum_self = np.array(q_val_sum_self)
+            act_self = q_val_sum_self.argmax()
+        else:
+            if is_self:
+                q_val = self.sub_q_val
+            else:
+                q_val = self.ob_q_val
+
+            phys_belief = np.zeros(self.num_inter_phys_state)
+            for i in range(belief.shape[0]):
+                istate, prob = belief[i]
+                s = int(istate[0])
+                phys_belief[s] += prob
+
+            # phys_belief /= phys_belief.sum()
+            q_val_sum = np.dot(phys_belief, q_val)
+            q_val_sum_self = list()
+            for a_self in self.act_space:
+                a_joint = [[a_self, a_other] for a_other in self.act_space]
+                a_joint_lin = [joint_to_lin(
+                    a, (self.act_space, self.act_space)) for a in a_joint]
+                q_val_sum_self.append(np.mean(q_val_sum[a_joint_lin]))
+            q_val_sum_self = np.array(q_val_sum_self)
+            act_self = q_val_sum_self.argmax()
+
+        return act_self
+
+    @staticmethod
+    def particle_sampling(dist, particle_size):
         """
         This method samples particles from the distribution given by the belief.
         :param dist: the probabilistic distribution given by the input belief
@@ -43,32 +178,47 @@ class IParticleFilter:
 
         return particles
 
-    def approx2exact(self, particles):
-        num_uniq_particle = len(set(particles))
+    @staticmethod
+    def approx2exact(particles):
+        particles_o2f = list()
+        for i in range(particles.shape[0]):
+            particles_o2f.append(np.append(particles[i][0], particles[i][1]))
+        unique_particles = np.unique(particles_o2f, axis=0)
+        num_uniq_particle = len(unique_particles)
         belief = np.zeros(shape=(num_uniq_particle, 2), dtype='object')
 
-        i = 0  # the index for assigning istates and corresponding probabilities
-        for particle in particles:
-            if particle in belief[:, 0]:
-                belief[np.where(belief[:, 0] == particle), 1] += 1
-            else:
-                belief[i] = np.array([particle, 1])
-                i += 1
+        for i in range(unique_particles.shape[0]):
+            particle = unique_particles[i].tolist()
+            count = 0
+            for pt in particles_o2f:
+                pt = pt.tolist()
+                if pt == particle:
+                    count += 1
+            belief[i] = np.array([particle, count])
 
-        assert np.sum(belief[:, 1]) == len(particles)
-        belief[:, 1] /= len(particles)  # normalization
+        # assert np.sum(belief[:, 1]) == len(particles), \
+        #     "total count of particles is %d" % np.sum(belief[:, 1])
+        try:
+            belief[:, 1] /= np.sum(belief[:, 1])  # normalization
+        except ZeroDivisionError:
+            belief[:, 1] /= np.sum(belief[:, 1]) + 1e-10
+            print(particles)
+            print("-" * 10)
+            print(particles_o2f)
+            print("-" * 10)
+            print(unique_particles)
 
         return belief
 
     def l0_particle_filtering(self, l0belief, act, obs):
         pr_act_other = 1 / self.num_action
         b_next = np.zeros(l0belief.shape)
-        for state_next in self.phys_state_space:
+        for state_next in self.l0_phys_state_space:
             if np.ndim(state_next):
                 state_next = joint_to_lin(
                     state_next, (self.agent_loc_space, self.door_loc_space))
             b_prime = 0
-            for state in self.phys_state_space:
+            for state in self.l0_phys_state_space:
                 if np.ndim(state):
                     state = joint_to_lin(
                         state, (self.agent_loc_space, self.door_loc_space))
@@ -78,7 +228,7 @@ class IParticleFilter:
                     joint_act_lin = joint_to_lin(
                         joint_act, (self.act_space, self.act_space))
                     pr_trans += np.multiply(
-                        self.trans_func[joint_act_lin, state, state_next],
+                        self.l0_trans_func[joint_act_lin][state, state_next],
                         pr_act_other)
                 b_prime += np.multiply(pr_trans, l0belief[state])
 
@@ -88,14 +238,26 @@ class IParticleFilter:
                 joint_act_lin = joint_to_lin(
                     joint_act, (self.act_space, self.act_space))
                 pr_obs += np.multiply(
-                    self.obs_func[joint_act_lin, state_next, obs], pr_act_other)
+                    self.l0_obs_func[joint_act_lin][state_next, obs],
+                    pr_act_other)
 
+            # print("state_next:", state_next)
+            # print("act:", act)
+            # print("obs:", obs)
+            # print("b_prime:", b_prime)
+            # print("pr_obs:", pr_obs)
             b_next[state_next] = np.multiply(pr_obs, b_prime)
+
+        # print("b_next", b_next)
+        b_next = np.divide(b_next, b_next.sum())
 
         return b_next
 
-    def i_particle_filtering(self, ibelief, act, obs, level=1):
-        assert level > 0
+    def i_particle_filtering(self, ibelief,
+                             act, obs,
+                             agent_level=1,
+                             first_step=False):
+        assert agent_level > 0
 
         b_tmp = np.zeros(
             (self.num_particle * self.num_obs, 2), dtype='object')
@@ -110,204 +272,118 @@ class IParticleFilter:
             if np.ndim(phys_state):
                 phys_state = joint_to_lin(
                     phys_state, (self.agent_loc_space, self.door_loc_space))
-            if level > 1:
-                act_other = self.qmdp_policy(ibelief)[0][0]
+
+            if agent_level > 1:
+                phys_belief_other = others_model[:self.num_inter_phys_state]
             else:
-                b = others_model[:self.num_phys_state]
-                act_other = np.random.choice(self.l0_policy(b))
+                phys_belief_other = others_model[:self.num_l0_phys_state]
+            if first_step:
+                act_other = self.params.init_action
+            else:
+                act_other = self.qmdp_policy(
+                phys_belief_other, agent_level=agent_level - 1, is_self=False)
 
             joint_act = [act, act_other]
             joint_act_lin = joint_to_lin(
                 joint_act, (self.act_space, self.act_space))
-            print(phys_state)
-            phys_state_next = self.phys_state_space[np.random.choice(
-                np.arange(self.num_phys_state),
-                p=self.trans_func[joint_act_lin, phys_state, :])]
-            assert not np.ndim(phys_state_next)
+            phys_state_next_lin = np.random.choice(
+                np.arange(self.num_inter_phys_state),
+                p=self.inter_trans_func[joint_act_lin][phys_state, :].toarray()[0])
+            assert not np.ndim(phys_state_next_lin)
 
-            for obs_other in range(self.num_obs):
-                if level == 1:
-                    b_other, frame_other = others_model
+            for obs_other in self.obs_space:
+                if agent_level == 1:
+                    b_other = others_model.copy()
+                    # print("b_other:")
+                    # print(b_other)
                     b_other_next = self.l0_particle_filtering(
                         l0belief=b_other,
                         act=act_other,
                         obs=obs_other)
-                    others_model_next = [b_other_next, frame_other]
-                    istate_next = [phys_state_next, others_model_next]
+                    # print("b_other_next:")
+                    # print(b_other_next)
+                    others_model_next = b_other_next.copy()
+                    istate_next = [phys_state_next_lin, others_model_next]
+                    # print("istate_next:")
+                    # print(istate_next)
+                    phys_state_next = lin_to_joint(
+                        phys_state_next_lin,
+                        (self.agent_loc_space,
+                         self.agent_loc_space,
+                         self.door_loc_space))
+                    l0_phys_state_next = np.array(
+                        [phys_state_next[1], phys_state_next[2]])
+                    l0_phys_state_next_lin = joint_to_lin(
+                        l0_phys_state_next,
+                        (self.agent_loc_space,
+                         self.door_loc_space))
+                    particle_weight = self.l0_obs_func[
+                        joint_act_lin][l0_phys_state_next_lin, obs_other]
+                    particle_weight *= self.inter_obs_func[
+                        joint_act_lin][phys_state_next_lin, obs]
+                    # print("particle_weight:")
+                    # print(particle_weight)
                 else:
-                    b_other, frame_other = others_model
+                    b_other = others_model.copy()
                     b_other_next = self.i_particle_filtering(
                         ibelief=b_other,
                         act=act_other,
                         obs=obs_other,
-                        level=level-1)
-                    others_model_next = [b_other_next, frame_other]
-                    istate_next = [phys_state_next, others_model_next]
+                        agent_level=agent_level-1)
+                    istate_next = [phys_state_next_lin, b_other_next]
+                    particle_weight = self.inter_obs_func[
+                        joint_act_lin, phys_state_next_lin, obs_other]
+                    particle_weight *= self.inter_obs_func[
+                        joint_act_lin, phys_state_next_lin, obs]
 
-                particle_weight = self.obs_func[
-                    act_other, phys_state_next, obs_other]
-                particle_weight *= self.obs_func[act, phys_state_next, obs]
                 b_tmp[count] = np.array([istate_next, particle_weight])
                 count += 1
 
         # Normalize particle weights to make them sum to 1.
-        b_tmp[:, 1] /= np.sum(b_tmp[:, 1])
+        # print(b_tmp)
+        b_tmp[:, 1] = np.divide(b_tmp[:, 1], np.sum(b_tmp[:, 1]))
 
         # Selection (down-sampling)
         b_next_approx = np.random.choice(
-            b_tmp[:, 0], size=self.num_particle, p=b_tmp[:, 1])
+            b_tmp[:, 0],
+            size=self.num_particle,
+            p=np.array(b_tmp[:, 1], dtype='f'))
         b_next = self.approx2exact(b_next_approx)
 
         return b_next
 
-    def l0_val_func(self, belief, num_iter=100):
-        print("num_iter_left:", num_iter)
-        q_vals = np.zeros(self.act_space.shape)
-        if num_iter > 0:
-            for a_self in self.act_space:
-                st_rwd = 0
-                for s in self.phys_state_space:
-                    s = joint_to_lin(
-                        s, (self.agent_loc_space, self.door_loc_space))
-                    for a_other in self.act_space:
-                        a_joint = [a_self, a_other]
-                        a_joint_lin = joint_to_lin(
-                            a_joint, (self.act_space, self.act_space))
-                        st_rwd += np.multiply(
-                            belief[s], self.reward_func[a_joint_lin, s])
-                lt_rwd = 0
-                for o in self.obs_space:
-                    pr_obs = 0
-                    for s in self.phys_state_space:
-                        s = joint_to_lin(
-                            s, (self.agent_loc_space, self.door_loc_space))
-                        for a_other in self.act_space:
-                            a_joint = [a_self, a_other]
-                            a_joint_lin = joint_to_lin(
-                                a_joint, (self.act_space, self.act_space))
-                            pr_obs += np.multiply(
-                                belief[s], self.obs_func[a_joint_lin, s, o])
-                    b_next = self.l0_particle_filtering(
-                        l0belief=belief, act=a_self, obs=o)
-                    self.count += 1
-                    print("VI executed count:", self.count)
-                    u_next, _ = self.l0_val_func(b_next, num_iter=num_iter - 1)
-                    lt_rwd += pr_obs * u_next
-                q_val = st_rwd + lt_rwd * self.discount
-                q_vals[a_self] = q_val
-            val = np.max(q_vals)
-        else:
-            for a_self in self.act_space:
-                st_rwd = 0
-                for s in self.phys_state_space:
-                    s = joint_to_lin(
-                        s, (self.agent_loc_space, self.door_loc_space))
-                    for a_other in self.act_space:
-                        a_joint = [a_self, a_other]
-                        a_joint_lin = joint_to_lin(
-                            a_joint, (self.act_space, self.act_space))
-                        # print("belief over state %d: %f" % (s, belief[s]))
-                        # print("reward of taking %d: %f" %
-                        #       (a_self, self.reward_func[a_joint_lin, s]))
-                        st_rwd += belief[s] * self.reward_func[a_joint_lin, s]
-                q_val = st_rwd
-                q_vals[a_self] = q_val
-            val = np.max(q_vals)
+    def process_trans_func(self, l0_trans_func, inter_trans_func):
+        self.l0_trans_func = [l0_trans_func[a].copy()
+                              for a in range(self.num_joint_action)]
+        self.inter_trans_func = [inter_trans_func[a].copy()
+                                 for a in range(self.num_joint_action)]
 
-        # print("value:", val)
+    def process_reward_func(self, l0_reward_func, inter_reward_func):
+        self.l0_reward_func = [l0_reward_func[a].copy()
+                               for a in range(self.num_joint_action)]
+        self.inter_reward_func = [inter_reward_func[a].copy()
+                                  for a in range(self.num_joint_action)]
 
-        return val, q_vals
+    def process_obs_func(self, l0_obs_func, inter_obs_func):
+        self.l0_obs_func = [l0_obs_func[a].copy()
+                            for a in range(self.num_joint_action)]
+        self.inter_obs_func = [inter_obs_func[a].copy()
+                               for a in range(self.num_joint_action)]
 
-    def l0_policy(self, b):
-        val, q_vals = self.l0_val_func(b, 2)
-        opt_act = np.argwhere(q_vals == val)
-        opt_act = np.array([x[0] for x in opt_act if np.ndim(x)])
-        return opt_act
+    def transfer_all_sparse(self):
+        self.l0_trans_func = self.transfer_sparse(self.l0_trans_func)
+        self.l0_reward_func = self.transfer_sparse(self.l0_reward_func)
+        self.l0_obs_func = self.transfer_sparse(self.l0_obs_func)
 
-    def ma_mdp_vi(self, num_iter=100):
-        q_vals_joint = np.zeros(
-            (self.num_phys_state, self.num_action, self.num_action))
+        self.inter_trans_func = self.transfer_sparse(self.inter_trans_func)
+        self.inter_reward_func = self.transfer_sparse(self.inter_reward_func)
+        self.inter_obs_func = self.transfer_sparse(self.inter_obs_func)
 
-        if num_iter > 0:
-            for s in self.phys_state_space:
-                s = joint_to_lin(
-                    s, (self.agent_loc_space, self.door_loc_space))
-                for a_self in self.act_space:
-                    for a_other in self.act_space:
-                        a_joint = joint_to_lin(
-                            [a_self, a_other], (self.act_space, self.act_space))
-                        st_rwd = self.reward_func[a_joint, s]
-                        lt_rwd = 0
-                        for s_next in self.phys_state_space:
-                            s_next = joint_to_lin(
-                                s_next, (self.agent_loc_space,
-                                         self.door_loc_space))
-                            pr_trans = self.trans_func[a_joint, s, s_next]
-                            lt_rwd += np.multiply(
-                                pr_trans, self.ma_mdp_vi(num_iter - 1))
-                        q_val = st_rwd + lt_rwd
-                        q_vals_joint[s, a_self, a_other] = q_val
-        else:
-            for s in self.phys_state_space:
-                s = joint_to_lin(
-                    s, (self.agent_loc_space, self.door_loc_space))
-                for a_self in self.act_space:
-                    for a_other in self.act_space:
-                        a_joint = joint_to_lin(
-                            [a_self, a_other], (self.act_space, self.act_space))
-                        st_rwd = self.reward_func[a_joint, s]
-                        q_val = st_rwd
-                        q_vals_joint[s, a_self, a_other] = q_val
+        self.issparse = True
 
-        q_vals_self = np.sum(q_vals_joint, axis=2)
-        vals = np.max(q_vals_self, axis=1)
-
-        return vals
-
-    def qmdp_policy(self, b_inter):
-        num_act_self = self.params.num_action
-        num_act_joint = self.params.num_joint_action
-        num_phys_state = self.params.num_phys_state
-
-        vals = self.ma_mdp_vi()
-
-        b_phys = np.zeros(self.phys_state_space.shape)
-        s_inter = b_inter[:, 0]
-        s_phys = list()
-        for s in s_inter:
-            s_phys.append(s[0])
-        phys_uniq = set(s_phys)
-        for s in phys_uniq:
-            for i in range(s_inter.shape[0]):
-                if s == s_inter[i][0]:
-                    b_phys[s] += b_inter[i, 1]
-
-        q_vals_self = np.zeros((num_act_self, num_phys_state))
-        q_vals_joint = np.zeros((num_act_joint, num_phys_state))
-        for a_self in self.act_space:
-            for a_other in self.act_space:
-                a_joint = [a_self, a_other]
-                a_joint = joint_to_lin(
-                    a_joint, (self.act_space, self.act_space))
-                st_rwd = self.reward_func[a_joint, :]
-                lt_rwd = np.zeros(self.phys_state_space.shape)
-                for s_next in self.phys_state_space:
-                    s_next = joint_to_lin(
-                        s_next, (self.agent_loc_space, self.door_loc_space))
-                    lt_rwd += np.multiply(
-                        vals[s_next], self.trans_func[a_joint, :, s_next])
-                q_vals_joint[a_joint, :] = st_rwd + lt_rwd
-                q_vals_joint[a_joint, :] = np.multiply(
-                    q_vals_joint[a_joint, :], b_phys)
-
-            idx = joint_to_lin(
-                [a_self, self.act_space[0]], (self.act_space, self.act_space))
-            q_vals_self[a_self] = np.mean(
-                q_vals_joint[idx:idx+num_act_self, :], axis=0)
-
-        q_vals_a = np.sum(q_vals_self, axis=1)
-
-        return np.argwhere(q_vals_a == np.max(q_vals_a))[0][0]  # argmax_a(q(a))
+    def transfer_sparse(self, matrix):
+        return [scipy.sparse.csr_matrix(matrix[a])
+                for a in range(self.num_joint_action)]
 
 
 def compute_lin_index(arr_indices, arr_space_sizes):
@@ -331,13 +407,12 @@ def compute_lin_index(arr_indices, arr_space_sizes):
     else:
         assert (len(arr_indices) >= 1), "No element exists in the input array."
 
-    return lin_idx
+    return int(lin_idx)
 
 
 def joint_to_lin(joint_coord, joint_space):
     joint_coord = np.array(joint_coord)
     joint_space = np.array(joint_space)
-
     assert (joint_coord.shape[0] == joint_space.shape[0]), \
         "The joint coordinate and the joint space must be in the same dimension"
 
@@ -356,24 +431,22 @@ def joint_to_lin(joint_coord, joint_space):
 
 def lin_to_joint(lin_idx, joint_space):
     joint_space = np.array(joint_space)
-    space_sizes = [len(space) for space in joint_space]
+    num_joint = joint_space.shape[0]
+    space_size = [space.shape[0] for space in joint_space][::-1]
 
-    i = 1
+    space_indices = list()
     numerator = lin_idx
-    denominator = space_sizes[i]
-    remainder = np.mod(numerator, denominator)
-
-    joint_coord = list()
-    while i + 1 < joint_space.shape[0]:
-        joint_coord.append(remainder)
+    i = 0
+    while i < len(space_size) - 1:
+        denominator = space_size[i]
+        space_indices.append(np.mod(numerator, denominator))
         numerator = np.floor_divide(numerator, denominator)
         i += 1
-        denominator = space_sizes[i]
-    joint_coord.append(np.mod(numerator, denominator))
-    joint_coord.append(np.floor_divide(numerator, denominator))
-    joint_coord = joint_coord[::-1]
+    space_indices.append(numerator)
+    space_indices = space_indices[::-1]
 
-    for i in range(len(joint_coord)):
-        joint_coord[i] = joint_space[i][joint_coord[i]]
+    joint_coord = np.zeros(num_joint, dtype='i')
+    for i in range(num_joint):
+        joint_coord[i] = joint_space[i][space_indices[i]]
 
     return joint_coord

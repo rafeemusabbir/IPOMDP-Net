@@ -40,7 +40,7 @@ def conv_layer(input_data,
             mean=w_mean,
             stddev=w_std,
             dtype=dtype),
-        type=dtype)
+        dtype=dtype)
 
     output = tf.nn.conv2d(
         input=input_data,
@@ -195,7 +195,7 @@ def scale_change_nd2lin(nd_tensor, fc_params, names=None):
     input_tensor = tf.reshape(
         tensor=nd_tensor,
         shape=(nd_tensor.get_shape().as_list()[0],
-               np.prod(np.array(nd_tensor.get_shape.as_list()[1:]))))
+               np.prod(np.array(nd_tensor.get_shape().as_list()[1:]))))
     output = fc_layers(
         input_data=input_tensor,
         fc_params=fc_params,
@@ -219,7 +219,7 @@ def scale_change_lin2nd(lin_tensor, output_shape, fc_params, names=None):
         fc_params=fc_params)
     output = tf.reshape(
         tensor=output,
-        shape=([lin_tensor.get_shape.as_list()[0]] + list(output_shape)),
+        shape=([lin_tensor.get_shape().as_list()[0]] + list(output_shape)),
         name=names)
 
     return output

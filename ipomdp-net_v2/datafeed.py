@@ -6,7 +6,7 @@ from env_tiger_grid import TigerGridBase
 
 try:
     import ipdb as pdb
-except Exception:
+except ImportError:
     import pdb
 
 
@@ -54,7 +54,7 @@ class DataFeed:
         db.open()
 
         # Preload all samples, because random access is slow(?)
-        # env_id, goal_state, step_id, traj_length, failed
+        # env_id, step_id, traj_length, failed
         samples = db.samples[:]
 
         # Filter valid samples.
@@ -89,24 +89,23 @@ class DataFeed:
         samples = samples[sample_indices]
         db.close()
 
-        # effective traj lens: exclude last step in the trajectory.
-        effective_traj_lens = samples[:, 3] - 1
+        # arr traj lens: array of lengths of the trajectories.
+        arr_traj_len = samples[:, 3]
 
         # limit effective_traj_lens to lim_traj_len
         if train_params.lim_traj_len > 0:
             print("Limit traj_len to %d" % train_params.lim_traj_len)
-            effective_traj_lens = np.clip(effective_traj_lens, 0,
-                                          train_params.lim_traj_len)
+            arr_traj_len = np.clip(arr_traj_len, 0, train_params.lim_traj_len)
 
         # sanity check
-        assert np.all(effective_traj_lens > 0)
+        assert np.all(arr_traj_len > 0)
 
         filtered_samples = np.stack((
             sample_indices,  # sample_id
             samples[:, 0],  # env_i
-            samples[:, 1],  # goal_state
+            samples[:, 1],  # terminal_map
             samples[:, 2],  # step_i
-            effective_traj_lens,  # effective_traj_len
+            arr_traj_len,  # processed arr_traj_len
         ), axis=1)
 
         return filtered_samples
@@ -130,17 +129,19 @@ class DataFeed:
             self.get_db = (
                 lambda: Database(filename=self.filename, cache=cache))
 
-        df = dataflow.DataFromList(lst=list(self.filtered_samples),
-                                   shuffle=(self.mode == 'train'))
+        df = dataflow.DataFromList(
+            lst=list(self.filtered_samples),
+            shuffle=(self.mode == 'train'))
 
         if restart_limit is None:  # restart_limit can be 0, which is not None.
             # Reshuffles on every repeat
             df = dataflow.RepeatedData(df, 1000000)
 
-        df = DynamicTrajBatch(df,
-                              batch_size=batch_size,
-                              step_size=step_size,
-                              traj_lens=self.filtered_samples[:, 4])
+        df = DynamicTrajBatch(
+            df,
+            batch_size=batch_size,
+            step_size=step_size,
+            arr_traj_len=self.filtered_samples[:, 4])
 
         self.steps_in_epoch = df.steps_in_epoch()
         # print("steps_in_epoch:", self.steps_in_epoch)
@@ -150,8 +151,12 @@ class DataFeed:
             self.steps_in_epoch = restart_limit
             df = OneShotData(df, size=restart_limit)
 
-        df = TrajDataFeed(df, self.get_db, self.domain, batch_size=batch_size,
-                          step_size=step_size)
+        df = TrajDataFeed(
+            ds=df,
+            get_db_func=self.get_db,
+            domain=self.domain,
+            batch_size=batch_size,
+            step_size=step_size)
 
         # Switch of dataflow speed test. (Uncomment to enable)
         # dataflow.TestDataSpeed(df, size=1000).start()
@@ -168,11 +173,12 @@ class DataFeed:
                                    shuffle=False)
         df = dataflow.RepeatedData(df, 1000000)
 
-        df = EvalDataFeed(df,
-                          self.get_db,
-                          self.domain,
-                          policy=policy,
-                          repeats=repeats)
+        df = EvalDataFeed(
+            ds=df,
+            get_db_func=self.get_db,
+            domain=self.domain,
+            policy=policy,
+            repeats=repeats)
 
         return df
 
@@ -190,7 +196,7 @@ class DataFeed:
 
 
 class DynamicTrajBatch(dataflow.BatchDataByShape):
-    def __init__(self, ds, batch_size, step_size, traj_lens):
+    def __init__(self, ds, batch_size, step_size, arr_traj_len):
         """
         Breaks trajectories into trainings steps and collets batches. Assume
         sequential input
@@ -204,16 +210,16 @@ class DynamicTrajBatch(dataflow.BatchDataByShape):
         https://blog.altoros.com/the-magic-behind-google-translate-sequence-to-
         sequence-models-and-tensorflow.html
 
-        :param ds: sequential input dataflow. Expects samples in the form
-            (sample_id, env_id, goal_state, step_id, traj_len)
+        :param ds: sequential input dataflow. Expected sample form is
+            (sample_id, env_id, step_id, traj_len)
         :param batch_size: batch size
         :param step_size: step size for BPTT
-        :param traj_lens: list of numpy array of trajectory lengths for ALL
+        :param arr_traj_len: list of numpy array of trajectory lengths for ALL
         samples in dataset. Used to compute size()
         :return batched data, each with shape [step_size, batch_size, ...].
             Adds is_start field, a binary indicator:
             1 if it is the first step of the trajectory, 0 otherwise.
-            Output: (sample_id, env_id, goal_state, step_id, traj_len, is_start)
+            Output: (sample_id, env_id, step_id, traj_len, is_start)
         """
         super(DynamicTrajBatch, self).__init__(
             ds=ds,
@@ -227,13 +233,13 @@ class DynamicTrajBatch(dataflow.BatchDataByShape):
 
         self.step_field = 3
         self.traj_len_field = 4
-        self.sample_fields = 6  # including is_start
+        self.sample_fields = 6  # sample_id, env_id, terminals, step_id, traj_len, is_start
 
-        blocks = ((traj_lens - 1) // self.step_size) + 1
+        blocks = ((arr_traj_len - 1) // self.step_size) + 1
         self._steps_in_epoch = np.sum(blocks) // self.batch_size
         self._total_epochs = (
             None if ds.size() is None
-            else ((ds.size() - 1) // len(traj_lens)) + 1)
+            else ((ds.size() - 1) // len(arr_traj_len)) + 1)
 
     def size(self):
         return self._steps_in_epoch * self._total_epochs
@@ -252,7 +258,7 @@ class DynamicTrajBatch(dataflow.BatchDataByShape):
             try:
                 while True:
                     # Collect which samples should be replaced by a new one.
-                    # For the non-zero indices the sample is still valid in
+                    # For the non-zero indices, the sample is still valid in
                     # the batch.
                     self.batch_samples[:, self.step_field] += self.step_size
                     self.batch_samples[:, self.traj_len_field] -= self.step_size
@@ -273,9 +279,6 @@ class DynamicTrajBatch(dataflow.BatchDataByShape):
 
 
 class EvalDataFeed(dataflow.ProxyDataFlow):
-    """
-
-    """
     def __init__(self, ds, get_db_func, domain, policy, repeats=1):
         super(EvalDataFeed, self).__init__(ds)
         self.get_db = get_db_func
@@ -308,23 +311,23 @@ class EvalDataFeed(dataflow.ProxyDataFlow):
     def eval_sample(self, sample):
         """
         :param sample: sample vector in the form
-        (sample_id, env_id, goal_state, step_id, traj_len)
+        (sample_id, env_id, step_id, traj_len)
         :return result matrix, first row for expert policy, consecutive rows
         for evaluated policy.
         fields: success rate, trajectory length, accumulated reward
         """
-        sample_i, env_i, goal_states, step_i, _ = [
-            np.atleast_1d(x.squeeze())
-            for x in np.split(sample, sample.shape[0], axis=0)
-        ]
+        sample_i, env_i, terminals, step_i, _ = [np.atleast_1d(x.squeeze())
+                                                 for x in np.split(
+                sample, sample.shape[0], axis=0)]
 
         env = self.db.envs[env_i[0]]
-        b0 = self.db.bs[sample_i[0]]
+        b0 = self.db.l0_bs[sample_i[0]]
+        ib0 = self.db.inter_bs[sample_i[0]]
         db_sample = self.db.samples[sample_i[0]]
         db_step = self.db.steps[step_i[0]]
 
         _, _, _, traj_len, failed = db_sample
-        state, act_last, linear_obs = db_step
+        phys_state_self_lin, act_self_last, obs_self_last = db_step
 
         success = (1 if failed == 0 else 0)
 
@@ -340,10 +343,10 @@ class EvalDataFeed(dataflow.ProxyDataFlow):
                 self.domain.simulate_policy(
                     policy=self.policy,
                     grid=env,
-                    b0=b0,
-                    init_state=state,
-                    goal_states=goal_states,
-                    first_action=act_last)
+                    l0_b0=b0,
+                    ib0=ib0,
+                    init_phys_state=phys_state_self_lin,
+                    first_action=act_self_last)
             success = (1 if success else 0)
 
             results[eval_i + 1] = np.array(
@@ -366,8 +369,6 @@ class TrajDataFeed(dataflow.ProxyDataFlow):
         self.domain = domain
         self.batch_size = batch_size
         self.step_size = step_size
-
-        self.traj_field_idx = 3
 
         self.db = None
 
@@ -404,21 +405,19 @@ class TrajDataFeed(dataflow.ProxyDataFlow):
         traj_len,
         is_start)
         """
-        sample_i, env_i, goal_states, step_i, traj_len, is_start = [
-            np.atleast_1d(x.squeeze())
-            for x in np.split(samples, samples.shape[1], axis=1)
-        ]
+        sample_i, env_i, terminal_i, step_i, traj_len, is_start = [np.atleast_1d(
+            x.squeeze()) for x in np.split(samples, samples.shape[1], axis=1)]
 
         env_img = self.db.envs[:][env_i]
-        goal_img = self.domain.process_goals(goal_states)
+        terminal_map = self.db.terminals[:][terminal_i]
 
-        # Initial belief
-        b0 = self.db.bs[:][sample_i]
-        b0 = self.domain.process_beliefs(b0)
+        # Initial belief for both level-0 and higher-level agents.
+        b0_other = self.db.l0_bs[:][sample_i]
+        b0_self = self.db.inter_bs[:][sample_i]
 
-        # produce all steps consisting of last_action, linobs, act_label
+        # produce all steps consisting of last_action, last_obs, act_label
         step_indices = step_i[None, :] + np.arange(self.step_size + 2)[:, None]
-        step_indices = step_indices.clip(max=len(self.db.steps)-1)
+        step_indices = step_indices.clip(max=len(self.db.steps) - 1)
 
         # mask for valid steps vs zero padding
         valid_mask = np.nonzero(
@@ -435,28 +434,17 @@ class TrajDataFeed(dataflow.ProxyDataFlow):
         # NOTE: inefficient if loading from disk.
         acts_label[valid_mask] = self.db.steps[label_idx_helper, 1]
 
-        linear_obs = self.db.steps[step_indices[:self.step_size][valid_mask], 2]
-        obs = np.zeros((self.step_size, self.batch_size, self.domain.obs_len-1),
-                       'i')
+        local_obs = self.db.steps[step_indices[:self.step_size][valid_mask], 2]
+        obs = np.zeros((self.step_size, self.batch_size), 'i')
 
-        obs[valid_mask] = self.domain.obs_lin_to_bin(linear_obs)
-        obs = np.insert(arr=obs,
-                        obj=self.domain.obs_len-1,
-                        values=0,
-                        axis=2)  # 4 directions + goal observation
-
-        for i in range(obs.shape[0]):
-            for j in range(obs.shape[1]):
-                direct_obs = list(obs[i, j][:4])
-                if direct_obs == [0, 1, 0, 1] or direct_obs == [1, 0, 1, 0]:
-                    obs[i, j] = np.array([0, 0, 0, 0, 1])
+        obs[valid_mask] = local_obs
 
         # set weights
         weights = np.zeros(acts_last.shape, 'f')
         weights[valid_mask] = 1.0
 
-        return [env_img, goal_img, b0, is_start, acts_last, obs, weights,
-                acts_label]
+        return [env_img, terminal_map, b0_other, b0_self, is_start, acts_last,
+                obs, weights, acts_label]
 
 
 class OneShotData(dataflow.FixedSizeData):

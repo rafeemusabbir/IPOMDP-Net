@@ -21,10 +21,10 @@ class IPOMDPNet:
         self.context_tensors = None
         self.belief = None  # used in QMDP setting
         self.update_belief_op = None # used in QMDP setting
-        self.l0belief = None  # used in I-POMDP setting
-        self.ibelief = None  # used in I-POMDP setting
-        self.update_l0belief_op = None  # used in I-POMDP setting
-        self.update_ibelief_op = None  # used in I-POMDP setting
+        self.belief_self = None  # used in I-POMDP setting
+        self.update_belief_self_op = None  # used in I-POMDP setting
+        self.particles = None
+        self.update_particles_op = None
         self.logits = None
         self.loss = None
 

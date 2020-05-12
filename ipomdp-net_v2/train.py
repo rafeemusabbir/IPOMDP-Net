@@ -35,13 +35,10 @@ def run_training(params):
     # get cache for training data
     train_cache = train_feed.build_cache()
 
-    df_train = train_feed.build_dataflow(params.batch_size,
-                                         params.step_size,
-                                         cache=train_cache)
-    df_valid = valid_feed.build_dataflow(params.batch_size,
-                                         params.step_size,
-                                         cache=train_cache,
-                                         restart_limit=10000)
+    df_train = train_feed.build_dataflow(
+        params.batch_size, params.step_size, cache=train_cache)
+    df_valid = valid_feed.build_dataflow(
+        params.batch_size, params.step_size, cache=train_cache, restart_limit=10000)
 
     df_train.reset_state()
     time.sleep(0.2)
@@ -54,23 +51,25 @@ def run_training(params):
     # built model into the default graph
     with tf.Graph().as_default():
         # build network for training
-        network = IPOMDPNetTigerGrid(params=params,
-                                     batch_size=params.batch_size,
-                                     step_size=params.step_size)
+        network = IPOMDPNetTigerGrid(
+            params=params,
+            batch_size=params.batch_size,
+            step_size=params.step_size)
         network.build_inference()  # build graph for inference including loss
-        network.build_train(
-            init_learning_rate=params.learning_rate)  # build training ops
+        network.build_train(params.learning_rate)  # build training ops
 
         # build network for evaluation
-        network_pred = IPOMDPNetTigerGrid(params=params,
-                                          batch_size=1,
-                                          step_size=1)
+        network_pred = IPOMDPNetTigerGrid(
+            params=params,
+            batch_size=1,
+            step_size=1)
         network_pred.build_inference(reuse=True)
 
         # Create a saver for writing training checkpoints.
         # If max_to_keep=0 will output useless log info
-        saver = tf.compat.v1.train.Saver(var_list=tf.compat.v1.trainable_variables(),
-                               max_to_keep=100)
+        saver = tf.compat.v1.train.Saver(
+            var_list=tf.compat.v1.trainable_variables(),
+            max_to_keep=100)
 
         # Get initialize Op
         init = tf.compat.v1.global_variables_initializer()
@@ -87,10 +86,11 @@ def run_training(params):
         # load previously saved model
         if params.loadmodel:
             print("Loading from "+params.loadmodel[0])
-            loader = tf.compat.v1.train.Saver(var_list=tf.compat.v1.trainable_variables())
+            loader = tf.compat.v1.train.Saver(tf.compat.v1.trainable_variables())
             loader.restore(sess, params.loadmodel[0])
 
-        summary_writer = tf.compat.v1.summary.FileWriter(params.log_path, sess.graph)
+        summary_writer = tf.compat.v1.summary.FileWriter(
+            params.log_path, sess.graph)
         summary_writer.flush()
 
     epoch = -1
@@ -108,14 +108,16 @@ def run_training(params):
             feed_dict = {network.placeholders[i]: data[i]
                          for i in range(len(network.placeholders))}
 
-            _, loss, _ = sess.run([network.train_op,
-                                   network.loss,
-                                   network.update_belief_op],
-                                  feed_dict=feed_dict)
+            _, loss, _, _ = sess.run(
+                [network.train_op,
+                 network.loss,
+                 network.update_belief_self_op,
+                 network.update_particles_op],
+                feed_dict=feed_dict)
             training_loss += loss
 
         # save belief and restore it after validation
-        belief = sess.run([network.belief])[0]
+        belief, particles = sess.run([network.belief_self, network.particles])
 
         # accumulate loss over the enitre validation set
         valid_loss = 0.0
@@ -125,11 +127,15 @@ def run_training(params):
             # assert step > 0 or np.isclose(data[3], 1.0).all()
             feed_dict = {network.placeholders[i]: data[i]
                          for i in range(len(network.placeholders))}
-            loss, _ = sess.run([network.loss, network.update_belief_op],
-                               feed_dict=feed_dict)
+            loss, _, _ = sess.run(
+                [network.loss,
+                 network.update_belief_self_op,
+                 network.update_particles_op],
+                feed_dict=feed_dict)
             valid_loss += loss
 
-        tf.compat.v1.assign(network.belief, belief)
+        tf.compat.v1.assign(network.belief_self, belief)
+        tf.compat.v1.assign(network.particles, particles)
 
         training_loss /= train_feed.steps_in_epoch
         valid_loss /= valid_feed.steps_in_epoch
@@ -238,13 +244,13 @@ def run_eval(params, model_file):
             np.mean(succ), np.mean(traj_len)))
     print("Expert")
     print_results(expert_results)
-    print("QMDP-Net")
+    print("IPOMDP-Net++")
     print_results(network_results)
 
 
 def main(arglist):
     params = parse_args(arglist)
-    print(params)
+    # print(params)
 
     if params.epochs == 0:
         assert len(params.load_model) == 1

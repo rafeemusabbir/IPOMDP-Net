@@ -3,6 +3,7 @@ import random
 import os
 
 import numpy as np
+import scipy.sparse
 import _pickle as pickle
 import tables
 
@@ -10,7 +11,7 @@ from utils.dotdict import dotdict
 
 try:
     import ipdb as pdb
-except Exception:
+except ImportError:
     import pdb
 
 from utils.interactive_particle_filter import IParticleFilter, \
@@ -37,19 +38,24 @@ class TigerGridBase(object):
         self.agent_birth_space = params.agent_birth_space
         self.door_loc_space = params.door_loc_space
 
-        self.phys_state_space = params.phys_state_space
+        self.l0_phys_state_space = params.l0_phys_state_space
+        self.inter_phys_state_space = params.inter_phys_state_space
         self.action_space = params.action_space
+        self.joint_action_space = params.joint_action_space
         self.obs_space = params.obs_space
 
-        self.observe_directions = params.observe_directions
-
+        self.num_l0_phys_state = params.num_l0_phys_state
+        self.num_inter_phys_state = params.num_inter_phys_state
         self.num_action = params.num_action
         self.num_joint_action = params.num_joint_action
         self.num_obs = params.num_obs
 
-        self.trans_func = None
-        self.reward_func = None
-        self.obs_func = None
+        self.l0_trans_func = None
+        self.l0_reward_func = None
+        self.l0_obs_func = None
+        self.inter_trans_func = None
+        self.inter_reward_func = None
+        self.inter_obs_func = None
 
         self.pr_trans_intent = params.pr_trans_intent
         self.pr_obs_dir_corr = params.pr_obs_dir_corr
@@ -61,113 +67,147 @@ class TigerGridBase(object):
         self.gold_cell = None
         self.tiger_cell = None
 
-    # def simulate_policy(self, policy, grid, b0, init_state,
-    #                     init_common_state, first_action=None):
-    #     params = self.params
-    #     max_traj_len = params.traj_limit
-    #
-    #     if not first_action:
-    #         first_action = params.init_action
-    #
-    #     self.grid = grid
-    #
-    #     self.gen_ipomdp(init_state[0])
-    #
-    #     state = init_state
-    #     reward_sum = 0.0  # accumulated reward
-    #
-    #     failed = False
-    #     step_i = 0
-    #
-    #     # initialize policy
-    #     env_img = grid[None]
-    #     b0_img = self.process_beliefs(b0)
-    #     policy.reset(env_img, b0_img)
-    #
-    #     act = first_action
-    #     obs = None
-    #
-    #     while True:
-    #         # finish if state is terminal, i.e. we reached a goal state
-    #         if all([np.isclose(qmdp.T[x][state, state], 1.0)
-    #                 for x in range(params.num_action)]):
-    #             assert state in goal_states
-    #             break
-    #
-    #         # stop if trajectory limit reached
-    #         if step_i >= max_traj_len:
-    #             failed = True
-    #             break
-    #
-    #         # choose next action
-    #         # if it is the initial step, stay will always be selected;
-    #         # otherwise the action is selected based on the learned policy
-    #         if step_i:
-    #             if obs >= 16:
-    #                 act = first_action
-    #             else:
-    #                 obs_without_goal = self.obs_lin_to_bin(obs)
-    #                 if list(obs_without_goal) == [0, 1, 0, 1] or \
-    #                         list(obs_without_goal) == [1, 0, 1, 0]:
-    #                     obs_with_goal = np.array([0, 0, 0, 0, 1])
-    #                 else:
-    #                     obs_with_goal = np.append(obs_without_goal, 0)
-    #                 act = policy.eval(act, obs_with_goal)
-    #
-    #         # simulate action
-    #         state, r = qmdp.transition(state, act)
-    #         obs = qmdp.random_obs(state, act)
-    #
-    #         # Update expected/accumulated reward.
-    #         reward_sum += r
-    #
-    #         step_i += 1
-    #
-    #     traj_len = step_i
-    #
-    #     return (not failed), traj_len, reward_sum
-
-    def generate_trajectories(self, db, num_traj):
+    def simulate_policy(self, policy, grid, l0_b0, ib0, init_phys_state,
+                        first_action=None, level=1):
         params = self.params
         max_traj_len = params.traj_limit
 
+        if not first_action:
+            first_action = params.init_action
+
+        self.grid = grid
+
+        self.gen_ipomdp()
+
+        phys_state_self_joint = lin_to_joint(
+            init_phys_state,
+            (self.agent_loc_space,
+             self.agent_loc_space,
+             self.door_loc_space)) \
+            if not np.ndim(init_phys_state) else init_phys_state.copy()
+        phys_state_self_lin = joint_to_lin(
+            init_phys_state,
+            (self.agent_loc_space,
+             self.agent_loc_space,
+             self.agent_loc_space)) \
+            if np.ndim(init_phys_state) else init_phys_state
+        reward_sum = 0.0  # accumulated reward
+
+        failed = False
+        step_i = 0
+
+        # Initialize the policy.
+        env_img = grid[None]
+        assert ib0.shape[0] == self.num_inter_phys_state
+        ib0 = np.array(
+            [[np.append(s, l0_b0), ib0[s]] for s in np.arange(ib0.shape[0])])
+        policy.reset(env_img, ib0)
+
+        act_self = act_other = first_action
+        act_joint_self = joint_to_lin(
+            [act_self, act_other], (self.action_space, self.action_space))
+        obs_self, obs_other = None, None
+
+        while True:
+            cell_self, cell_other = phys_state_self_joint[:2]
+
+            # Terminate if the [s, a] pair trigger the env reset.
+            if cell_self in [self.gold_cell, self.tiger_cell] and \
+                    (act_self == self.action_space[-1]):
+                step_i += 1
+                break
+
+            if cell_other in [self.gold_cell, self.tiger_cell] and \
+                    (act_other == self.action_space[-1]):
+                step_i += 1
+                break
+
+            # Terminate if trajectory limit is reached.
+            if step_i >= max_traj_len:
+                failed = True
+                break
+
+            # choose next action
+            # if it is the initial step, stay will always be selected;
+            # otherwise the action is selected based on the learned policy
+            if not step_i:
+                # dummy first action
+                act_self = act_other = params.init_action
+            else:
+                act_self, act_other = policy.eval(
+                    last_act=act_self, last_obs=obs_self)
+
+            #  Simulate action
+            phys_state_prime_self_joint, \
+            phys_state_prime_self_lin, r = self.transit(
+                state=phys_state_self_lin,
+                action=act_joint_self,
+                agent_level=level)
+            obs_self = self.observe(
+                state=phys_state_prime_self_lin,
+                action=act_joint_self,
+                agent_level=level)
+
+            # Update expected/accumulated reward.
+            reward_sum += r
+
+            step_i += 1
+
+        traj_len = step_i
+
+        return (not failed), traj_len, reward_sum
+
+    def generate_trajectories(self, db, num_traj, level):
+        params = self.params
+        max_traj_len = params.traj_limit
+
+        i_pf, b0, ib0 = self.gen_component_env()
+        i_pf.solve_qmdp()
+
         for traj_i in range(num_traj):
-            # generate a QMDP object, initial belief, initial state and
+            # generate a I-PF instance, initial belief, initial state and
             # goal state, also generates a random grid for the first iteration
-            i_pf, b0, ib0, \
-            init_state_self, \
-            init_state_others = self.random_instance((traj_i == 0))
+            init_state_self, init_state_other = self.gen_component_traj(
+                b0_other=b0, print_init=False)
 
-            state_self = init_state_self
+            terminal = np.zeros(self.N * self.M)
+            terminal[self.door_loc_space] = 1
+            terminal = terminal.reshape(self.grid_shape)
+
+            state_self = init_state_self.copy()
             state_self_lin = state_self.copy()
-            phys_state_self = state_self[:2]
+            phys_state_self = state_self[:3]
             phys_state_self_lin = joint_to_lin(
-                phys_state_self, (self.agent_loc_space, self.door_loc_space))
-            state_self_lin[0] = phys_state_self_lin
-            state_others = init_state_others
-            state_others_lin = joint_to_lin(
-                state_others, (self.agent_loc_space, self.door_loc_space))
+                phys_state_self,
+                (self.agent_loc_space,
+                 self.agent_loc_space,
+                 self.door_loc_space))
+            state_self_lin = np.append(phys_state_self_lin, state_self_lin[3:])
+            state_other = init_state_other
+            state_other_lin = joint_to_lin(
+                state_other, (self.agent_loc_space, self.door_loc_space))
 
-            b_others = b0.copy()
+            b_other = b0.copy()
             b_self = ib0.copy()
             reward_sum = 0.0  # accumulated reward
 
             # Trajectory of beliefs
             beliefs_self = [ib0]
-            beliefs_others = [b0]
+            beliefs_other = [b0]
             # Trajectory of states
             states_self = [state_self]
             states_self_lin = [state_self_lin]
-            states_others = [state_others]
-            states_others_lin = [state_others_lin]
+            phys_states_self_lin = [phys_state_self_lin]
+            states_other = [state_other]
+            states_other_lin = [state_other_lin]
             # Trajectory of actions: first action is always stay.
             actions_self = list()
-            actions_others = list()
+            actions_other = list()
             # Trajectory of rewards
             rewards = list()
             # Trajectory of observations
             observs_self = list()
-            observs_others = list()
+            observs_other = list()
 
             failed = False
             step_i = 0
@@ -179,76 +219,106 @@ class TigerGridBase(object):
                     break
 
                 # choose action
-                if step_i == 0:
+                if not step_i:
                     # dummy first action
-                    act_self = act_others = params.init_action
+                    act_self = act_other = params.init_action
+                    is_first_step = True
                 else:
-                    act_self = i_pf.qmdp_policy(b_self)
-                    act_others = i_pf.l0_policy(b_others)
+                    act_self = i_pf.qmdp_policy(
+                        belief=b_self,
+                        agent_level=level,
+                        is_self=True)
+                    act_other = i_pf.qmdp_policy(
+                        belief=b_other,
+                        agent_level=level - 1,
+                        is_self=False)
+                    is_first_step = False
+                print("AGENT i CHOOSES ACTION [%d]" % act_self)
+                print("AGENT j CHOOSES ACTION [%d]" % act_other)
 
                 actions_self.append(act_self)
-                actions_others.append(act_others)
-                act_joint = [act_self, act_others]
+                actions_other.append(act_other)
+                act_joint_self = [act_self, act_other]
+                act_joint_other = [act_other, act_self]
 
                 #  Simulate action
                 phys_state_prime_self, \
                 phys_state_prime_self_lin, r = self.transit(
-                    state=phys_state_self,
-                    action=act_joint)
-                state_prime_others, state_prime_others_lin, _ = self.transit(
-                    state=state_others,
-                    action=act_joint)
+                    state=phys_state_self_lin,
+                    action=act_joint_self,
+                    agent_level=level)
+                # state_prime_other, state_prime_other_lin, _ = self.transit(
+                #     state=state_other_lin,
+                #     action=act_joint,
+                #     agent_level=level - 1)
+                state_prime_other = phys_state_prime_self[1:]
+                state_prime_other_lin = joint_to_lin(
+                    state_prime_other,
+                    (self.agent_loc_space,
+                     self.door_loc_space))
 
                 rewards.append(r)
                 reward_sum += r
 
+                obs_self = self.observe(
+                    state=phys_state_prime_self_lin,
+                    action=act_joint_self,
+                    agent_level=level)
+                obs_other = self.observe(
+                    state=state_prime_other_lin,
+                    action=act_joint_other,
+                    agent_level=level - 1)
+                print("AGENT i OBSERVES [%d]" % obs_self)
+                print("AGENT j OBSERVES [%d]" % obs_other)
+
+                observs_self.append(obs_self)
+                observs_other.append(obs_other)
+
+                b_other = i_pf.l0_particle_filtering(
+                    l0belief=b_other,
+                    act=act_other,
+                    obs=obs_other)
+
                 # Finish if either agent opens either door.
                 cell_self = state_self[0]
-                cell_others = state_others[0]
+                cell_other = state_other[0]
 
-                if np.any(cell_self == np.array(
-                        [self.gold_cell, self.tiger_cell])) and \
+                if cell_self in [self.gold_cell, self.tiger_cell] and \
                         (act_self == self.action_space[-1]):
+                    step_i += 1
                     break
 
-                if np.any(cell_others == np.array(
-                        [self.gold_cell, self.tiger_cell])) and \
-                        (act_others == self.action_space[-1]):
+                if cell_other in [self.gold_cell, self.tiger_cell] and \
+                        (act_other == self.action_space[-1]):
+                    step_i += 1
                     break
 
                 phys_state_self = phys_state_prime_self.copy()
                 phys_state_self_lin = phys_state_prime_self_lin
-                state_others = state_prime_others
-                state_others_lin = state_prime_others_lin
-                states_others.append(state_others)
-                states_others_lin.append(state_others_lin)
+                phys_states_self_lin.append(phys_state_self_lin)
+                state_other = state_prime_other.copy()
+                state_other_lin = state_prime_other_lin
+                states_other.append(state_other)
+                states_other_lin.append(state_other_lin)
+                print("AGENT i is at STATE:", phys_state_self)
+                print("AGENT j is at STATE:", state_other)
 
-                obs_self = self.observe(
-                    state=phys_state_self,
-                    action=act_joint)
-                obs_others = self.observe(
-                    state=state_others,
-                    action=act_joint)
-
-                observs_self.append(obs_self)
-                observs_others.append(obs_others)
-
-                b_others = i_pf.l0_particle_filtering(
-                    l0belief=b_others,
-                    act=act_others,
-                    obs=obs_others)
-                state_self = np.concatenate([phys_state_self, b_others])
-                state_self_lin = np.concatenate(
-                    [[phys_state_self_lin], b_others])
+                state_self = np.concatenate([phys_state_self, b_other])
+                state_self_lin = np.append(phys_state_self_lin, b_other)
                 states_self.append(state_self)
                 states_self_lin.append(state_self_lin)
 
                 b_self = i_pf.i_particle_filtering(
                     ibelief=b_self,
                     act=act_self,
-                    obs=obs_self)
+                    obs=obs_self,
+                    first_step=is_first_step)
+                # print("THE BELIEF OF i:")
+                # print(b_self)
+                # print("THE BELIEF OF j:")
+                # print(b_other)
                 beliefs_self.append(b_self)
-                beliefs_others.append(b_others)
+                beliefs_other.append(b_other)
 
                 step_i += 1
 
@@ -260,388 +330,1299 @@ class TigerGridBase(object):
 
             # step: state (linear), action, observation (linear)
             step = np.stack(
-                [states_self[:traj_len],
-                 actions_self[:traj_len],
-                 observs_self[:traj_len]], axis=1)
+                [np.array(phys_states_self_lin[:traj_len]),
+                 np.array(actions_self[:traj_len]),
+                 np.array(observs_self[:traj_len])],
+                axis=1)
 
-            print("--THE STATE TRAJECTORY OF i--")
-            for i in range(traj_len):
-                print(states_self[i])
-            print("-" * 30)
-            print("--THE STATE TRAJECTORY OF j--")
-            for i in range(traj_len):
-                print(states_others[i])
-            print("-" * 30)
-            print("--THE BELIEF TRAJECTORY OF i--")
-            for i in range(traj_len):
-                print("Step:", i)
-                print(beliefs_self[i])
-            print("-" * 30)
-            print("--THE BELIEF TRAJECTORY OF j--")
-            for i in range(traj_len):
-                print("Step:", i)
-                print(beliefs_others[i])
-            print("-" * 30)
-            print("--THE ACTION TRAJECTORY OF i--")
-            for i in range(traj_len):
-                print(actions_self[i])
-            print("-" * 30)
-            print("--THE ACTION TRAJECTORY OF j--")
-            for i in range(traj_len):
-                print(actions_others[i])
-            print("-" * 30)
-            print("--THE REWARD TRAJECTORY OF i--")
-            for i in range(traj_len):
-                print(rewards[i])
-            print("-" * 30)
-            print("--THE OBSERVATION TRAJECTORY OF i--")
-            for i in range(traj_len):
-                print(observs_self[i])
-            print("-" * 30)
-            print("--THE OBSERVATION TRAJECTORY OF j--")
-            for i in range(traj_len):
-                print(observs_others[i])
-            print("-" * 30)
+            # print("--THE STATE TRAJECTORY OF i--")
+            # for i in range(traj_len):
+            #     print(states_self[i])
+            # print("-" * 20)
+            # print("--THE STATE TRAJECTORY OF j--")
+            # for i in range(traj_len):
+            #     print(states_other[i])
+            # print("-" * 20)
+            # print("--THE BELIEF TRAJECTORY OF i--")
+            # for i in range(traj_len):
+            #     print("Step:", i)
+            #     print(beliefs_self[i])
+            # print("-" * 20)
+            # print("--THE BELIEF TRAJECTORY OF j--")
+            # for i in range(traj_len):
+            #     print("Step:", i)
+            #     print(beliefs_other[i])
+            # print("-" * 20)
+            # print("--THE ACTION TRAJECTORY OF i--")
+            # for i in range(traj_len):
+            #     print(actions_self[i])
+            # print("-" * 20)
+            # print("--THE ACTION TRAJECTORY OF j--")
+            # for i in range(traj_len):
+            #     print(actions_other[i])
+            # print("-" * 20)
+            # print("--THE REWARD TRAJECTORY OF i--")
+            # for i in range(traj_len):
+            #     print(rewards[i])
+            # print("-" * 20)
+            # print("--THE OBSERVATION TRAJECTORY OF i--")
+            # for i in range(traj_len):
+            #     print(observs_self[i])
+            # print("-" * 20)
+            # print("--THE OBSERVATION TRAJECTORY OF j--")
+            # for i in range(traj_len):
+            #     print(observs_other[i])
+            # print("-" * 20)
 
             # sample: env_id, goal_state, step_id, traj_len, failed
             # length includes both start and goal (so one step path is length 2)
             sample = np.array(
-                [len(db.root.envs), len(db.root.steps), traj_len, failed], 'i')
+                [len(db.root.envs), len(db.root.terminals),
+                 len(db.root.steps), traj_len, failed], 'i')
 
             db.root.samples.append(sample[None])
-            db.root.bs.append(np.array(beliefs_self[:1]))  # only picks init_bs
+            db.root.terminals.append(np.array(terminal[None]))
+            db.root.inter_bs.append(np.array([ib0[:, 1]]))
+            db.root.l0_bs.append(np.array(beliefs_other[:1]))
             db.root.expRs.append([reward_sum])
             db.root.steps.append(step)
 
         # add environment only after adding all trajectories
         db.root.envs.append(self.grid[None])
 
-    def random_instance(self, generate_grid=True):
+    def gen_component_env(self, print_init=False):
         """
-        Generate a random problem instance for a grid.
-        Picks a random initial belief, initial state and goal states.
-        :param generate_grid: generate a new grid and POMDP model if True,
-        otherwise use self.grid
+
+        :param print_init:
         :return:
         """
-        if generate_grid:
-            self.grid = self.gen_grid(
-                grid_n=self.params.grid_n, grid_m=self.params.grid_m)
+        self.grid = self.gen_grid(self.params.grid_n, self.params.grid_m)
 
-            # The two door-cells are fixed for one environment over
-            # different instances.
-            door_cells = self.gen_door_cells()
-            self.gold_cell, self.tiger_cell = door_cells
+        # The two door-cells are fixed for one environment over
+        # different instances.
+        door_cells = self.gen_door_cells()
+        self.gold_cell, self.tiger_cell = door_cells
 
         # sample initial belief
         # b0: initial belief uniformly distributed over (4 * 4) states
         b0, ib0 = self.gen_init_belief()
 
-        # Sample initial cells for the two agents.
-        init_cells = self.gen_init_cells()
-        init_self_cell, init_others_cell = init_cells
-        init_phys_state_self = np.array([init_self_cell, self.gold_cell])
-        init_inter_state_self = np.concatenate([init_phys_state_self, b0])
-        init_phys_state_others = np.array([init_others_cell, self.gold_cell])
-
-        print("THE INITIAL PHYSICAL STATE FOR j:")
-        print(init_phys_state_others)
-        print("THE INITIAL BELIEF FOR AGENT j:")
-        print(b0)
-        print("THE INITIAL PHYSICAL STATE FOR i:")
-        print(init_phys_state_self)
-        print("THE INITIAL INTERACTIVE STATE FOR i:")
-        print(init_inter_state_self)
-        print("THE INITIAL BELIEF FOR AGENT i:")
-        print(ib0)
-
         # Generate POMDP model: self.T, self.Z, self.R
-        self.gen_ipomdp(self.gold_cell)
+        self.gen_ipomdp()
 
         # Initiate an instance of I-PF
-        i_pf = IParticleFilter(
-            trans_func=self.trans_func,
-            reward_func=self.reward_func,
-            obs_func=self.obs_func,
-            params=self.params)
+        i_pf = self.get_i_pf()
 
-        return i_pf, b0, ib0, init_inter_state_self, \
-               init_phys_state_others
+        if print_init:
+            print("THE INITIAL BELIEF FOR AGENT j:")
+            print(b0)
+            print("THE INITIAL BELIEF FOR AGENT i:")
+            print(ib0)
 
-    def gen_ipomdp(self, gold_cell):
+        return i_pf, b0, ib0
+
+    def gen_component_traj(self, b0_other, print_init=False):
+        """
+        Generate a random problem instance for a grid.
+        Picks a random initial belief, initial state and goal states.
+        :param b0_other:
+        :param print_init:
+        :return:
+        """
+        # Sample initial cells for the two agents.
+        init_cells = self.gen_init_cells()
+        init_self_cell, init_other_cell = init_cells
+        init_phys_state_self = np.array(
+            [init_self_cell, init_other_cell, self.gold_cell])
+        init_inter_state_self = np.concatenate([init_phys_state_self, b0_other])
+        init_phys_state_other = np.array([init_other_cell, self.gold_cell])
+
+        if print_init:
+            print("THE INITIAL PHYSICAL STATE FOR j:")
+            print(init_phys_state_other)
+            print("THE INITIAL PHYSICAL STATE FOR i:")
+            print(init_phys_state_self)
+            print("THE INITIAL INTERACTIVE STATE FOR i:")
+            print(init_inter_state_self)
+
+        return init_inter_state_self, init_phys_state_other
+
+    def gen_ipomdp(self):
         # Construct all I-POMDP model (obs_func, trans_func, reward_func)
-        self.obs_func = self.build_obs_func(gold_cell)
-        self.trans_func, self.reward_func = \
-            self.build_trans_reward_func(gold_cell)
+        self.l0_obs_func, self.inter_obs_func = self.build_obs_func("export")
+        self.l0_trans_func, self.l0_reward_func, self.inter_trans_func, \
+        self.inter_reward_func = self.build_trans_reward_func("export")
 
-    def build_obs_func(self, gold_cell):
+    def get_i_pf(self):
+        i_pf = IParticleFilter(self.params)
+
+        i_pf.process_trans_func(self.l0_trans_func, self.inter_trans_func)
+        i_pf.process_reward_func(self.l0_reward_func, self.inter_reward_func)
+        i_pf.process_obs_func(self.l0_obs_func, self.inter_obs_func)
+
+        i_pf.transfer_all_sparse()
+
+        return i_pf
+
+    def build_obs_func(self, info_present=None):
         """
         Build the observation model (obs_func) for a grid.
-        :param gold_cell: the cell (linear representation) with
         the gold door in it.
         :return: obs_func
         """
-        gold_coord = self.cell_lin_to_bin(gold_cell)
-        num_phys_state = self.phys_state_space.shape[0]
+        num_door_birthplace = self.door_loc_space.shape[0]
 
-        obs_func = np.zeros(
-            [self.num_joint_action, num_phys_state, self.num_obs], dtype='f')
-
-        for i in range(self.N):
-            for j in range(self.M):
-                cell_coord = np.array([i, j])
-                cell = self.cell_bin_to_lin(cell_coord)
-                state = np.array([cell, gold_cell])
-                state_lin = joint_to_lin(
-                    state, (self.agent_loc_space, self.door_loc_space))
-
-                for act_other in self.action_space:
-
-                    # action: stay and listen
-                    act_stay = self.action_space[0]
-                    act_joint = [act_stay, act_other]
-                    act_joint_lin = joint_to_lin(
-                        act_joint, (self.action_space, self.action_space))
-
-                    if i > gold_coord[0]:  # gold cell is to the north
-                        obs_ml = self.obs_space[0]
-                        obs_side = self.obs_space[1:4]
-                        obs_func[act_joint_lin,
-                                 state_lin,
-                                 obs_ml] = self.pr_obs_dir_corr
-                        obs_func[act_joint_lin, state_lin, obs_side] = \
-                            (1 - self.pr_obs_dir_corr) / len(obs_side)
-
-                        if j < gold_coord[1]:  # gold cell is in the northeast
-                            obs_ml = self.obs_space[:2]
-                            obs_side = self.obs_space[2:4]
-                            obs_func[act_joint_lin, state_lin, obs_ml] = \
-                                (1 - obs_func[act_joint_lin, state_lin, obs_side]
-                                 * len(obs_side)) / len(obs_ml)
-                        if j > gold_coord[1]:  # gold cell is in the northwest
-                            obs_ml = np.array([self.obs_space[0],
-                                               self.obs_space[3]])
-                            obs_side = self.obs_space[1:3]
-                            obs_func[act_joint_lin, state_lin, obs_ml] = \
-                                (1 - obs_func[act_joint_lin, state_lin, obs_side]
-                                 * len(obs_side)) / len(obs_ml)
-
-                    elif i < gold_coord[0]:  # gold cell is in the south
-                        obs_ml = self.obs_space[2]
-                        obs_side = np.concatenate(
-                            (self.obs_space[:2], self.obs_space[3:4]))
-                        obs_func[act_joint_lin,
-                                 state_lin,
-                                 obs_ml] = self.pr_obs_dir_corr
-                        obs_func[act_joint_lin, state_lin, obs_side] = \
-                            (1 - self.pr_obs_dir_corr) / len(obs_side)
-
-                        if j < gold_coord[1]:  # gold cell is in the southeast
-                            obs_ml = self.obs_space[1:3]
-                            obs_side = [self.obs_space[0], self.obs_space[3]]
-                            obs_func[act_joint_lin, state_lin, obs_ml] = \
-                                (1 - obs_func[act_joint_lin, state_lin, obs_side]
-                                 * len(obs_side)) / len(obs_ml)
-
-                        if j > gold_coord[1]:  # gold cell is in the southwest
-                            obs_ml = self.obs_space[2:4]
-                            obs_side = self.obs_space[:2]
-                            obs_func[act_joint_lin, state_lin, obs_ml] = \
-                                (1 - obs_func[act_joint_lin, state_lin, obs_side]
-                                 * len(obs_side)) / len(obs_ml)
-
-                    elif j < gold_coord[1]:  # gold cell is in the east
-                        obs_ml = self.obs_space[1]
-                        obs_side = np.concatenate(
-                            (self.obs_space[:1], self.obs_space[2:4]))
-                        obs_func[act_joint_lin,
-                                 state_lin,
-                                 obs_ml] = self.pr_obs_dir_corr
-                        obs_func[act_joint_lin, state_lin, obs_side] = \
-                            (1 - self.pr_obs_dir_corr) / len(obs_side)
-
-                    elif j > gold_coord[1]:  # gold cell is in the west
-                        obs_ml = self.obs_space[3]
-                        obs_side = self.obs_space[:3]
-                        obs_func[act_joint_lin,
-                                 state_lin,
-                                 obs_ml] = self.pr_obs_dir_corr
-                        obs_func[act_joint_lin, state_lin, obs_side] = \
-                            (1 - self.pr_obs_dir_corr) / len(obs_side)
-
-                    else:
-                        obs_ml = self.obs_space[4]
-                        obs_func[act_joint_lin,
-                                 state_lin,
-                                 obs_ml] = self.pr_obs_door_corr
-
-                    # action: move actions & door-opening
-                    act_mob = self.action_space[1:]
-                    act_joint = [[a, act_other] for a in act_mob]
-                    act_joint_lin = [joint_to_lin(
-                        aj, (self.action_space, self.action_space))
-                        for aj in act_joint]
-                    for obs in self.obs_space[:4]:
-                        obs_func[act_joint_lin, state_lin, obs] = \
-                            1 / np.shape(self.obs_space[:4])[0]
-
-        print("OBSERVATION FUNCTION")
-        print(obs_func)
-
-        return obs_func
-
-    def build_trans_reward_func(self, gold_cell):
-        """
-        Build transition (trans_func) and reward (reward_func) model for a grid.
-        :return:
-        trans_func: the transition function followed by level-0 (modeled) agent
-        reward_func: the reward function followed by level-0 agent
-        """
-        num_phys_state = self.phys_state_space.shape[0]
-
-        gold_coord = self.cell_lin_to_bin(gold_cell)
-        tiger_coord = [gold_coord[0], self.M - 1 - gold_coord[1]]
-        tiger_cell = self.cell_bin_to_lin(tiger_coord)
-
-        # Probability of transition with a0 from s to s'
-        trans_func = np.zeros(
-            shape=(self.num_joint_action, num_phys_state, num_phys_state),
+        l0_obs_func = np.zeros(
+            [self.num_joint_action, self.num_l0_phys_state, self.num_obs],
+            dtype='f')
+        inter_obs_func = np.zeros(
+            [self.num_joint_action, self.num_inter_phys_state, self.num_obs],
             dtype='f')
 
-        # Scalar reward of transition with a0 from s1 to s2 (only depend on s2)
-        reward_func = np.zeros(
-            shape=(self.num_joint_action, num_phys_state), dtype='f')
+        for act_other in self.action_space:
+            # 1. action <- STAY $ LISTEN
+            act_self = self.action_space[0]
+            act_joint = np.array([act_self, act_other])
+            act_joint_lin = joint_to_lin(
+                act_joint, (self.action_space, self.action_space))
+            for gold_cell in self.door_loc_space:
+                gold_x, gold_y = self.cell_lin_to_bin(gold_cell)
+                idx_gold_in_space = np.argwhere(
+                    gold_cell == self.door_loc_space)[0][0]
+                idx_tiger_in_space = \
+                    num_door_birthplace - 1 - idx_gold_in_space
+                tiger_cell = self.door_loc_space[idx_tiger_in_space]
+                for cell_self in self.agent_loc_space:
+                    l0_state = np.array([cell_self, gold_cell])
+                    l0_state_lin = joint_to_lin(
+                        l0_state, (self.agent_loc_space, self.door_loc_space))
+                    # When the agent is located in either the gold cell or the
+                    # tiger cell, its observation is 100% "door-found".
+                    if cell_self in [gold_cell, tiger_cell]:
+                        obs = self.obs_space[-1]
+                        l0_obs_func[
+                            act_joint_lin,
+                            l0_state_lin,
+                            obs] = self.pr_obs_door_corr
 
-        for i in range(self.N):
-            for j in range(self.M):
-                self_coord = np.array([i, j])
-                self_cell = self.cell_bin_to_lin(self_coord)
-                state = np.array([self_cell, gold_cell])
-                state_lin = joint_to_lin(
-                    state, (self.agent_loc_space, self.door_loc_space))
-
-                for act_other in self.action_space:
-                    # action: stay & listen
-                    act_stay = self.action_space[0]
-                    act_joint = [act_stay, act_other]
-                    act_joint_lin = joint_to_lin(
-                        act_joint, (self.action_space, self.action_space))
-                    state_prime_lin = state_lin
-                    trans_func[act_joint_lin, state_lin, state_prime_lin] = 1.0
-                    reward_func[act_joint_lin,
-                                state_lin] = self.params.reward_listen
-
-                    # action: open the door
-                    act_open = self.action_space[-1]
-                    act_joint = [act_open, act_other]
-                    act_joint_lin = joint_to_lin(
-                        act_joint, (self.action_space, self.action_space))
-                    if state[0] == gold_cell:  # the agent is in the gold cell
-                        self_cell_next = self.params.agent_birth_space
-                        state_prime = np.array(
-                            [[x, gold_cell] for x in self_cell_next])
-                        state_prime_lin = np.array([joint_to_lin(
-                            s, (self.agent_loc_space, self.door_loc_space))
-                            for s in state_prime])
-                        trans_func[act_joint_lin,
-                                   state_lin,
-                                   state_prime_lin] = 1.0 / len(self_cell_next)
-                        reward_func[act_joint_lin,
-                                    state_lin] = self.params.reward_gold
-                    elif state[0] == tiger_cell:
-                        self_cell_next = self.params.agent_birth_space
-                        state_prime = np.array(
-                            [[x, gold_cell] for x in self_cell_next])
-                        state_prime_lin = np.array([joint_to_lin(
-                            s, (self.agent_loc_space, self.door_loc_space))
-                            for s in state_prime])
-                        trans_func[act_joint_lin,
-                                   state_lin,
-                                   state_prime_lin] = 1.0 / len(self_cell_next)
-                        reward_func[act_joint_lin,
-                                    state_lin] = self.params.reward_tiger
                     else:
-                        state_prime_lin = state_lin
-                        trans_func[act_joint_lin,
-                                   state_lin,
-                                   state_prime_lin] = 1.0
-                        reward_func[act_joint_lin,
-                                    state_lin] = self.params.reward_wrong_open
+                        # Mistakenly hear "door-found" at a non-door cell.
+                        obs_wrong_door = self.obs_space[-1]
+                        l0_obs_func[
+                            act_joint_lin,
+                            l0_state_lin,
+                            obs_wrong_door] = 0.01
+                        x, y = self.cell_lin_to_bin(cell_self)
+                        if x > gold_x:  # gold cell is to the north
+                            obs_ml = self.obs_space[0]
+                            obs_side = self.obs_space[1:4]
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_ml] = self.pr_obs_dir_corr
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
 
-                    # action: move-N, move-E, move-S, move-W
-                    for act in self.action_space[1:-1]:
-                        act_joint = [act, act_other]
-                        act_joint_lin = joint_to_lin(
-                            act_joint, (self.action_space, self.action_space))
-                        intent_coord = self.apply_move(
-                            coord_in=self_coord, move=self.moves[act])
-                        side_coords = list()
-                        if self.is_outbound(intent_coord):
-                            intent_coord = self_coord
-                        intent_cell = self.cell_bin_to_lin(intent_coord)
-                        state_prime = np.array([intent_cell, gold_cell])
-                        state_prime_lin = joint_to_lin(
-                            state_prime,
-                            (self.agent_loc_space, self.door_loc_space))
-                        trans_func[act_joint_lin,
-                                   state_lin,
-                                   state_prime_lin] = self.pr_trans_intent
-                        if self.moves[act][0]:  # [1, 0] or [-1, 0]
-                            side_moves = [x for x in self.moves if x[1]]
-                            side_coords = \
-                                np.array([self.apply_move(self_coord, y)
-                                          for y in side_moves])
-                        elif self.moves[act][1]:
-                            side_moves = [x for x in self.moves if x[0]]
-                            side_coords = \
-                                np.array([self.apply_move(self_coord, y)
-                                          for y in side_moves])
-                        for coord in side_coords:
-                            if self.is_outbound(coord):
-                                coord = self_coord
-                            side_cell = self.cell_bin_to_lin(coord)
-                            if side_cell == self_cell:
-                                state_prime_lin = state_lin
-                                trans_func[act_joint_lin,
-                                           state_lin,
-                                           state_prime_lin] += \
-                                    (1 - self.pr_trans_intent) / 2
+                            if y < gold_y:  # gold cell is in the northeast
+                                obs_ml = self.obs_space[:2]
+                                obs_side = self.obs_space[2:4]
+                                l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_ml] = (1 - 0.01 - l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+                            elif y > gold_y:  # gold cell is in the northwest
+                                obs_ml = np.array(
+                                    [self.obs_space[0], self.obs_space[3]])
+                                obs_side = self.obs_space[1:3]
+                                l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_ml] = (1 - 0.01 - l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                        elif x < gold_x:  # gold cell is in the south
+                            obs_ml = self.obs_space[2]
+                            obs_side = np.concatenate(
+                                (self.obs_space[:2], self.obs_space[3:4]))
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_ml] = self.pr_obs_dir_corr
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+
+                            if y < gold_y:  # gold cell is in the southeast
+                                obs_ml = self.obs_space[1:3]
+                                obs_side = np.array(
+                                    [self.obs_space[0], self.obs_space[3]])
+                                l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_ml] = (1 - 0.01 - l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                            elif y > gold_y:  # gold cell is in the southwest
+                                obs_ml = self.obs_space[2:4]
+                                obs_side = self.obs_space[:2]
+                                l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_ml] = (1 - 0.01 - l0_obs_func[
+                                    act_joint_lin,
+                                    l0_state_lin,
+                                    obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                        elif y < gold_y:  # gold cell is in the east
+                            obs_ml = self.obs_space[1]
+                            obs_side = np.concatenate(
+                                (self.obs_space[:1], self.obs_space[2:4]))
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_ml] = self.pr_obs_dir_corr
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+
+                        elif y > gold_y:  # gold cell is in the west
+                            obs_ml = self.obs_space[3]
+                            obs_side = self.obs_space[:3]
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_ml] = self.pr_obs_dir_corr
+                            l0_obs_func[
+                                act_joint_lin,
+                                l0_state_lin,
+                                obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+                        else:
+                            assert False, "(%d, %d)" % (x, y)
+
+                    for cell_other in self.agent_loc_space:
+                        inter_state = np.array(
+                            [cell_self, cell_other, gold_cell])
+                        inter_state_lin = joint_to_lin(
+                            inter_state,
+                            (self.agent_loc_space,
+                             self.agent_loc_space,
+                             self.door_loc_space))
+                        # When the agent is located in either the gold cell
+                        # or the tiger cell, its observation is 100% "door-
+                        # found".
+                        if cell_self in [gold_cell, tiger_cell]:
+                            obs = self.obs_space[-1]
+                            inter_obs_func[
+                                act_joint_lin,
+                                inter_state_lin,
+                                obs] = self.pr_obs_door_corr
+
+                        else:
+                            # Mistakenly hear "door-found" at a non-door cell.
+                            obs_wrong_door = self.obs_space[-1]
+                            inter_obs_func[
+                                act_joint_lin,
+                                inter_state_lin,
+                                obs_wrong_door] = 0.01
+                            x, y = self.cell_lin_to_bin(cell_self)
+                            if x > gold_x:  # gold cell is to the north
+                                obs_ml = self.obs_space[0]
+                                obs_side = self.obs_space[1:4]
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_ml] = self.pr_obs_dir_corr
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+
+                                if y < gold_y:  # gold cell is in the northeast
+                                    obs_ml = self.obs_space[:2]
+                                    obs_side = self.obs_space[2:4]
+                                    inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_ml] = (1 - 0.01 - inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+                                elif y > gold_y:  # gold cell is in the northwest
+                                    obs_ml = np.array(
+                                        [self.obs_space[0], self.obs_space[3]])
+                                    obs_side = self.obs_space[1:3]
+                                    inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_ml] = (1 - 0.01 - inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                            elif x < gold_x:  # gold cell is in the south
+                                obs_ml = self.obs_space[2]
+                                obs_side = np.concatenate(
+                                    (self.obs_space[:2], self.obs_space[3:4]))
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_ml] = self.pr_obs_dir_corr
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+
+                                if y < gold_y:  # gold cell is in the southeast
+                                    obs_ml = self.obs_space[1:3]
+                                    obs_side = np.array(
+                                        [self.obs_space[0], self.obs_space[3]])
+                                    inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_ml] = (1 - 0.01 - inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                                elif y > gold_y:  # gold cell is in the southwest
+                                    obs_ml = self.obs_space[2:4]
+                                    obs_side = self.obs_space[:2]
+                                    inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_ml] = (1 - 0.01 - inter_obs_func[
+                                        act_joint_lin,
+                                        inter_state_lin,
+                                        obs_side] * obs_side.shape[0]) / obs_ml.shape[0]
+
+                            elif y < gold_y:  # gold cell is in the east
+                                obs_ml = self.obs_space[1]
+                                obs_side = np.concatenate(
+                                    (self.obs_space[:1], self.obs_space[2:4]))
+                                inter_obs_func[act_joint_lin,
+                                               inter_state_lin,
+                                               obs_ml] = self.pr_obs_dir_corr
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
+
+                            elif y > gold_y:  # gold cell is in the west
+                                obs_ml = self.obs_space[3]
+                                obs_side = self.obs_space[:3]
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_ml] = self.pr_obs_dir_corr
+                                inter_obs_func[
+                                    act_joint_lin,
+                                    inter_state_lin,
+                                    obs_side] = (1 - self.pr_obs_dir_corr - 0.01) / obs_side.shape[0]
                             else:
-                                state_prime = np.array([side_cell, gold_cell])
-                                state_prime_lin = joint_to_lin(
-                                    state_prime,
-                                    (self.agent_loc_space, self.door_loc_space))
-                                trans_func[act_joint_lin,
-                                           state_lin,
-                                           state_prime_lin] = \
-                                    (1 - self.pr_trans_intent) / 2
+                                assert False, "(%d, %d)" % (x, y)
 
-                        reward_func[act_joint_lin, :] = self.params.reward_move
+            # 2. action <- move-X or door-open
+            arr_act_self = self.action_space[1:]
+            arr_act_joint = [[a, act_other] for a in arr_act_self]
+            arr_act_joint_lin = [joint_to_lin(
+                aj, (self.action_space, self.action_space))
+                for aj in arr_act_joint]
+            for gold_cell in self.door_loc_space:
+                for cell_self in self.agent_loc_space:
+                    l0_state = np.array([cell_self, gold_cell])
+                    l0_state_lin = joint_to_lin(
+                        l0_state, (self.agent_loc_space, self.door_loc_space))
+                    obs_door = self.obs_space[-1]
+                    l0_obs_func[arr_act_joint_lin,
+                                l0_state_lin,
+                                obs_door] = 0.01
+                    for obs in self.obs_space[:4]:
+                        l0_obs_func[
+                            arr_act_joint_lin,
+                            l0_state_lin,
+                            obs] = (1 - 0.01) / self.obs_space[:4].shape[0]
 
-        print("TRANSITION FUNCTION")
-        print(trans_func)
-        print("REWARD FUNCTION")
-        print(reward_func)
-        return trans_func, reward_func
+                    for cell_other in self.agent_loc_space:
+                        inter_state = np.array(
+                            [cell_self, cell_other, gold_cell])
+                        inter_state_lin = joint_to_lin(
+                            inter_state,
+                            (self.agent_loc_space,
+                             self.agent_loc_space,
+                             self.door_loc_space))
+                        inter_obs_func[arr_act_joint_lin,
+                                       inter_state_lin,
+                                       obs_door] = 0.01
+                        for obs in self.obs_space[:4]:
+                            inter_obs_func[
+                                arr_act_joint_lin,
+                                inter_state_lin,
+                                obs] = (1 - 0.01) / self.obs_space[:4].shape[0]
 
-    def transit(self, state, action):
-        if np.ndim(state):
-            state = joint_to_lin(
-                state, (self.agent_loc_space, self.door_loc_space))
-        if np.ndim(action):
-            action = joint_to_lin(
-                action, (self.agent_loc_space, self.door_loc_space))
+        # for a in range(l0_obs_func.shape[0]):
+        #     for s in range(l0_obs_func.shape[1]):
+        #         if l0_obs_func[a, s, :].sum() != 1:
+        #             print("LEVEL-0")
+        #             print("A: %d, S:%d" % (a, s))
+        #             print(l0_obs_func[a, s, :])
+        #             print(l0_obs_func[a, s, :].sum())
+        #
+        # for a in range(inter_obs_func.shape[0]):
+        #     for s in range(inter_obs_func.shape[1]):
+        #         if inter_obs_func[a, s, :].sum() != 1:
+        #             print("INTERACTIVE")
+        #             print("A: %d, S:%d" % (a, s))
+        #             print(inter_obs_func[a, s, :])
+        #             print(inter_obs_func[a, s, :].sum())
 
-        dist = self.trans_func[action, state, :]
-        state_prime_lin = np.random.choice(
-            np.arange(self.params.num_phys_state), p=dist)
-        state_prime = lin_to_joint(
-            state_prime_lin, (self.agent_loc_space, self.door_loc_space))
-        reward = self.reward_func[action, state]
+        if info_present is "export":
+            with open("./data/O.txt", mode='w') as f:
+                f.write("LEVEL-0 OBSERVATION FUNCTION")
+                for a in range(len(l0_obs_func)):
+                    ai, aj = lin_to_joint(a, (
+                        self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(l0_obs_func[a]))
+                f.write("-" * 10)
+                f.write("INTERACTIVE OBSERVATION FUNCTION")
+                for a in range(len(inter_obs_func)):
+                    ai, aj = lin_to_joint(
+                        a, (self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(inter_obs_func[a]))
+        elif info_present is "console":
+            print("-" * 20)
+            print("LEVEL-0 OBSERVATION FUNCTION")
+            for a in range(len(l0_obs_func)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(l0_obs_func[a])
+            print("-" * 10)
+            print("INTERACTIVE OBSERVATION FUNCTION")
+            for a in range(len(inter_obs_func)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(inter_obs_func[a])
+        else:
+            pass
 
-        return state_prime, state_prime_lin, reward
+        return l0_obs_func, inter_obs_func
 
-    def observe(self, state, action):
+    def build_trans_reward_func(self, info_present=None):
+        """
+        Build transition (trans_func) and reward (reward_func) model for a grid.
+        :param info_present:
+        :return:
+        """
+        num_agent_birthplace = self.agent_birth_space.shape[0]
+        num_door_birthplace = self.door_loc_space.shape[0]
+        params = self.params
+
+        pr_trans_intent = params.pr_trans_intent
+        pr_trans_side = (1 - pr_trans_intent) / 2
+
+        reward_gold = params.reward_gold
+        reward_tiger = params.reward_tiger
+        reward_listen = params.reward_listen
+        reward_wrong_open = params.reward_wrong_open
+        reward_move = params.reward_move
+
+        # Initialize matrices for transition and reward functions.
+        # trans_func_l0 -- matrix for the level-0 transition function.
+        # Shape: (A, S, S') where S = S' = N_a_i * N_g, A = A_i * A_j
+        # DataType: float within [0., 1.]
+        trans_func_l0 = [scipy.sparse.lil_matrix(
+            (self.num_l0_phys_state, self.num_l0_phys_state), dtype='f')
+            for _ in range(self.num_joint_action)]
+        # reward_func_l0 -- matrix for the level-0 reward function.
+        # shape: (A, S, S') where S = S' = N_a_i * N_g, A = A_i * A_j
+        # DataType: float, any real value.
+        reward_func_l0 = [scipy.sparse.lil_matrix(
+            (self.num_l0_phys_state, self.num_l0_phys_state), dtype='f')
+            for _ in range(self.num_joint_action)]
+        # trans_func_inter -- matrix for the interactive transition function.
+        # Shape: (A, S, S') where S = S' = N_a_i * N_a_j * N_g. A = A_i * A_j
+        # DataType: float within [0., 1.]
+        trans_func_inter = [scipy.sparse.lil_matrix(
+            (self.num_inter_phys_state, self.num_inter_phys_state), dtype='f')
+            for _ in range(self.num_joint_action)]
+        # reward_func_inter -- matrix for the interactive reward function.
+        # shape: (A, S, S') where S = S' = N_a_i * N_a_j * N_g, A = A_i * A_j
+        # DataType: float, any real value.
+        reward_func_inter = [scipy.sparse.lil_matrix(
+            (self.num_inter_phys_state, self.num_inter_phys_state), dtype='f')
+            for _ in range(self.num_joint_action)]
+
+        # Assign values for the matrices in the order of A -> S -> S'
+        # Order of the actions in the action space:
+        # 1) STAY & LISTEN
+        # 2) MOVE NORTH
+        # 3) MOVE EAST
+        # 4) MOVE SOUTH
+        # 5) MOVE WEST
+        # 6) OPEN THE DOOR
+        # --------
+        # 1. action <- STAY & LISTEN
+        # When the subjective agent stays and listens for gaining observation,
+        # it determinately stays at the previous state after applying the
+        # action, which means that the probability for it to transit from one
+        # state to the same state is 1, while for the transitions to all other
+        # states are 0s.
+        act_self = self.action_space[0]
+        for act_other in self.action_space:
+            act_joint = np.array([act_self, act_other])
+            act_joint_lin = joint_to_lin(
+                act_joint, (self.action_space, self.action_space))
+            for gold_cell in self.door_loc_space:
+                for cell_self in self.agent_loc_space:
+                    l0_state = np.array([cell_self, gold_cell])
+                    l0_state_lin = joint_to_lin(
+                        l0_state, (self.agent_loc_space, self.door_loc_space))
+                    l0_state_next_lin = l0_state_lin
+                    trans_func_l0[
+                        act_joint_lin][
+                        l0_state_lin,
+                        l0_state_next_lin] = 1
+                    reward_func_l0[
+                        act_joint_lin][l0_state_lin, :] = reward_listen
+
+        # 2. action <- [MOVE-N, MOVE-E, MOVE-S, MOVE-W]
+        #
+        for act_self in self.action_space[1:-1]:
+            for act_other in self.action_space:
+                act_joint = np.array([act_self, act_other])
+                act_joint_lin = joint_to_lin(
+                    act_joint, (self.action_space, self.action_space))
+                for gold_cell in self.door_loc_space:
+                    for cell_self in self.agent_loc_space:
+                        l0_state = np.array([cell_self, gold_cell])
+                        l0_state_lin = joint_to_lin(
+                            l0_state,
+                            (self.agent_loc_space,
+                             self.door_loc_space))
+                        # Get the intentonal and side next cells respectively.
+                        cell_self_intent, cell_self_side = \
+                            self.get_intent_side_cells(
+                                move_action=act_self,
+                                cell=cell_self)
+                        l0_state_intent = np.array(
+                            [cell_self_intent, gold_cell])
+                        l0_state_intent_lin = joint_to_lin(
+                            l0_state_intent,
+                            (self.agent_loc_space,
+                              self.door_loc_space))
+                        trans_func_l0[
+                            act_joint_lin][
+                            l0_state_lin,
+                            l0_state_intent_lin] += pr_trans_intent
+
+                        for cell in cell_self_side:
+                            l0_state_side = np.array([cell, gold_cell])
+                            l0_state_side_lin = joint_to_lin(
+                                l0_state_side,
+                                (self.agent_loc_space,
+                                 self.door_loc_space))
+                            trans_func_l0[
+                                act_joint_lin][
+                                l0_state_lin,
+                                l0_state_side_lin] += pr_trans_side
+
+                        reward_func_l0[
+                            act_joint_lin][l0_state_lin, :] = reward_move
+
+        # 3. action <- open the door
+        #
+        act_self = self.action_space[-1]
+        for act_other in self.action_space:
+            act_joint = [act_self, act_other]
+            act_joint_lin = joint_to_lin(
+                act_joint, (self.action_space, self.action_space))
+            for gold_cell in self.door_loc_space:
+                # Inferring the cell where the tiger occupies according to
+                # the gold-cell.
+                idx_gold_in_space = np.argwhere(
+                    gold_cell == self.door_loc_space)[0][0]
+                idx_tiger_in_space = \
+                    num_door_birthplace - 1 - idx_gold_in_space
+                tiger_cell = self.door_loc_space[
+                    idx_tiger_in_space]
+
+                for cell_self in self.agent_loc_space:
+                    l0_state = np.array([cell_self, gold_cell])
+                    l0_state_lin = joint_to_lin(
+                        l0_state, (self.agent_loc_space, self.door_loc_space))
+
+                    # Given that the subjective agent applies the door-opening
+                    # action, if it occupies either gold or tiger cell for now,
+                    # the environment will reset, where the two agents are
+                    # re-located in random cell(s) of the spawning space. On the
+                    # other hand, the location of the two doors remain fixed,
+                    # while the gold and the tiger appear randomly behind them,
+                    # which means they may either maintain or swap their
+                    # locations after the reset. Hence, the probability of
+                    # a transition from a state before the reset to one after
+                    # should be equal to [1 / (agent_birthplace_size)] * (1/2).
+                    #
+                    # 1. When the agent is in the same cell as the gold or tiger
+                    if cell_self in [gold_cell, tiger_cell]:
+                        for cell_self_next in self.agent_birth_space:
+                            # 1) The gold and the tiger remain in the same cell
+                            # after the reset.
+                            l0_state_next = [cell_self_next, gold_cell]
+                            l0_state_next_lin = joint_to_lin(
+                                l0_state_next,
+                                (self.agent_loc_space,
+                                 self.door_loc_space))
+                            trans_func_l0[
+                                act_joint_lin][
+                                l0_state_lin,
+                                l0_state_next_lin] = 1 / (num_agent_birthplace * 2)
+
+                            # 2) The gold and the tiger swap their locations
+                            # after the reset.
+                            l0_state_next = [cell_self_next, tiger_cell]
+                            l0_state_next_lin = joint_to_lin(
+                                l0_state_next,
+                                (self.agent_loc_space,
+                                    self.door_loc_space))
+                            trans_func_l0[
+                                act_joint_lin][
+                                l0_state_lin,
+                                l0_state_next_lin] = 1 / (num_agent_birthplace * 2)
+                        # Fill in the level-0 reward function matrix.
+                        # If the agent is in the gold cell, then it will receive
+                        # a reward of finding the gold after opening the door.
+                        # Otherwise, the agent will get a punishment due to
+                        # encountering the tiger after opening the door.
+                        if cell_self == gold_cell:
+                            reward_func_l0[
+                                act_joint_lin][l0_state_lin, :] = reward_gold
+                        else:
+                            reward_func_l0[
+                                act_joint_lin][l0_state_lin, :] = reward_tiger
+
+                    # 2. When the agent is located in neither tiger cell nor
+                    # gold cell, opening the door will not lead to any state
+                    # change, but this will cost -10 in the reward.
+                    else:
+                        l0_state_next_lin = l0_state_lin
+                        trans_func_l0[
+                            act_joint_lin][
+                            l0_state_lin,
+                            l0_state_next_lin] = 1
+                        reward_func_l0[
+                            act_joint_lin][
+                        l0_state_lin, :] = reward_wrong_open
+
+        # 1.
+        act_self = self.action_space[0]
+        for act_other in self.action_space:
+            act_joint = np.array([act_self, act_other])
+            act_joint_lin = joint_to_lin(
+                act_joint, (self.action_space, self.action_space))
+            for gold_cell in self.door_loc_space:
+                idx_gold_in_space = np.argwhere(
+                    gold_cell == self.door_loc_space)[0][0]
+                idx_tiger_in_space = \
+                    num_door_birthplace - 1 - idx_gold_in_space
+                tiger_cell = self.door_loc_space[idx_tiger_in_space]
+
+                for cell_self in self.agent_loc_space:
+                    cell_self_next = cell_self
+                    for cell_other in self.agent_loc_space:
+                        inter_state = np.array(
+                            [cell_self, cell_other, gold_cell])
+                        inter_state_lin = joint_to_lin(
+                            inter_state,
+                            (self.agent_loc_space,
+                             self.agent_loc_space,
+                             self.door_loc_space))
+                        reward_func_inter[
+                            act_joint_lin][inter_state_lin, :] = reward_listen
+                        if act_other == self.action_space[0]:
+                            inter_state_next_lin = inter_state_lin
+                            trans_func_inter[
+                                act_joint_lin][
+                                inter_state_lin,
+                                inter_state_next_lin] = 1
+                        elif act_other in self.action_space[1:-1]:
+                            cell_other_intent, cell_other_side = \
+                                self.get_intent_side_cells(
+                                    move_action=act_other,
+                                    cell=cell_other)
+                            inter_state_intent = np.array(
+                                [cell_self_next,
+                                 cell_other_intent,
+                                 gold_cell])
+                            inter_state_intent_lin = joint_to_lin(
+                                inter_state_intent,
+                                (self.agent_loc_space,
+                                 self.agent_loc_space,
+                                 self.door_loc_space))
+                            trans_func_inter[
+                                act_joint_lin][
+                                inter_state_lin,
+                                inter_state_intent_lin] += pr_trans_intent
+                            for cell in cell_other_side:
+                                inter_state_side = np.array(
+                                    [cell_self_next, cell, gold_cell])
+                                inter_state_side_lin = joint_to_lin(
+                                    inter_state_side,
+                                    (self.agent_loc_space,
+                                     self.agent_loc_space,
+                                     self.door_loc_space))
+                                trans_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin,
+                                    inter_state_side_lin] += pr_trans_side
+                        else:
+                            if cell_other in [gold_cell, tiger_cell]:
+                                for cell_self_next in self.agent_birth_space:
+                                    for cell_other_next in self.agent_birth_space:
+                                        # There is a 0.5 chance that the gold
+                                        # cell remains in the same location
+                                        # after the reset.
+                                        inter_state_next = np.array(
+                                            [cell_self_next,
+                                             cell_other_next,
+                                             gold_cell])
+                                        inter_state_next_lin = joint_to_lin(
+                                            inter_state_next,
+                                            (self.agent_loc_space,
+                                             self.agent_loc_space,
+                                             self.door_loc_space))
+                                        trans_func_inter[
+                                            act_joint_lin][
+                                            inter_state_lin,
+                                            inter_state_next_lin] += \
+                                            1 / (num_agent_birthplace *
+                                                 num_agent_birthplace * 2)
+                                        # There is another 0.5 chance that the
+                                        # gold and tiger cell will swap their
+                                        # locations after the reset.
+                                        inter_state_next = np.array(
+                                            [cell_self_next,
+                                             cell_other_next,
+                                             tiger_cell])
+                                        inter_state_next_lin = joint_to_lin(
+                                            inter_state_next,
+                                            (self.agent_loc_space,
+                                             self.agent_loc_space,
+                                             self.door_loc_space))
+                                        trans_func_inter[
+                                            act_joint_lin][
+                                            inter_state_lin,
+                                            inter_state_next_lin] += \
+                                            1 / (num_agent_birthplace *
+                                                 num_agent_birthplace * 2)
+                            else:
+                                inter_state_next_lin = inter_state_lin
+                                trans_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin,
+                                    inter_state_next_lin] = 1
+
+        # 2.
+        for act_self in self.action_space[1:-1]:
+            for act_other in self.action_space:
+                act_joint = np.array([act_self, act_other])
+                act_joint_lin = joint_to_lin(
+                    act_joint, (self.action_space, self.action_space))
+                for gold_cell in self.door_loc_space:
+                    idx_gold_in_space = np.argwhere(
+                        gold_cell == self.door_loc_space)[0][0]
+                    idx_tiger_in_space = \
+                        num_door_birthplace - 1 - idx_gold_in_space
+                    tiger_cell = self.door_loc_space[
+                        idx_tiger_in_space]
+
+                    for cell_self in self.agent_loc_space:
+                        l0_state_self = np.array([cell_self, gold_cell])
+                        l0_state_self_lin = joint_to_lin(
+                            l0_state_self,
+                            (self.agent_loc_space,
+                             self.door_loc_space))
+                        # Get the intentional and side next cells respectively.
+                        cell_self_intent, cell_self_side = \
+                            self.get_intent_side_cells(
+                                move_action=act_self,
+                                cell=cell_self)
+                        # Get the level-0 state for the subjective agent when
+                        # it moves along intentional directions.
+                        l0_state_intent_self = np.array(
+                            [cell_self_intent, gold_cell])
+                        l0_state_intent_self_lin = joint_to_lin(
+                            l0_state_intent_self,
+                            (self.agent_loc_space,
+                             self.door_loc_space))
+                        pr_intent_self = trans_func_l0[
+                            act_joint_lin][
+                            l0_state_self_lin,
+                            l0_state_intent_self_lin]
+                        # Collect the level-0 state for the subjective agent
+                        # when it moves along side directions.
+                        l0_state_side_self_lin = list()
+                        pr_side_self = list()
+                        for cell in cell_self_side:
+                            l0_state_side = np.array([cell, gold_cell])
+                            l0_state_side_lin = joint_to_lin(
+                                l0_state_side,
+                                (self.agent_loc_space,
+                                 self.door_loc_space))
+                            l0_state_side_self_lin.append(l0_state_side_lin)
+                            pr_side_self.append(
+                                trans_func_l0[
+                                    act_joint_lin][
+                                    l0_state_self_lin,
+                                    l0_state_side_lin])
+
+                        for cell_other in self.agent_loc_space:
+                            l0_state_other = np.array(
+                                [cell_other, gold_cell])
+                            l0_state_other_lin = joint_to_lin(
+                                l0_state_other,
+                                (self.agent_loc_space, self.door_loc_space))
+
+                            inter_state = np.array(
+                                [cell_self, cell_other, gold_cell])
+                            inter_state_lin = joint_to_lin(
+                                inter_state,
+                                (self.agent_loc_space,
+                                 self.agent_loc_space,
+                                 self.door_loc_space))
+                            reward_func_inter[
+                                act_joint_lin][
+                                inter_state_lin, :] = reward_move
+
+                            # 1. The objective agent chooses to stay and to gain
+                            # additional observation.
+                            if act_other == self.action_space[0]:
+                                cell_other_next = cell_other
+                                # When the subjective agent moves towards the
+                                # intentional direction and reaches its expected
+                                # next cell.
+                                inter_state_intent = np.array(
+                                    [cell_self_intent,
+                                     cell_other_next,
+                                     gold_cell])
+                                inter_state_intent_lin = joint_to_lin(
+                                    inter_state_intent,
+                                    (self.agent_loc_space,
+                                     self.agent_loc_space,
+                                     self.door_loc_space))
+                                trans_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin,
+                                    inter_state_intent_lin] += pr_trans_intent
+                                # When the subjective agent moves towards either
+                                # orthogonal direction of the intentional one
+                                # and it ends up getting into a neighbor cell.
+                                for cell in cell_self_side:
+                                    inter_state_side = np.array(
+                                        [cell, cell_other_next, gold_cell])
+                                    inter_state_side_lin = joint_to_lin(
+                                        inter_state_side,
+                                        (self.agent_loc_space,
+                                         self.agent_loc_space,
+                                         self.door_loc_space))
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_side_lin] += pr_trans_side
+
+                            # 2. The objective agent chooses to move along any
+                            # cardinal direction.
+                            elif act_other in self.action_space[1:-1]:
+                                cell_other_intent, cell_other_side = \
+                                    self.get_intent_side_cells(
+                                        move_action=act_other,
+                                        cell=cell_other)
+
+                                pr_inter_state_next = dict()
+                                cell_self_next_move = np.append(
+                                    cell_self_intent, cell_self_side)
+                                cell_other_next_move = np.append(
+                                    cell_other_intent, cell_other_side)
+                                pr_list = [pr_trans_intent, pr_trans_side, pr_trans_side]
+                                for i in range(len(cell_self_next_move)):
+                                    for j in range(len(cell_other_next_move)):
+                                        inter_state_next = np.array(
+                                            [cell_self_next_move[i],
+                                             cell_other_next_move[j],
+                                             gold_cell])
+                                        inter_state_next_lin = joint_to_lin(
+                                            inter_state_next,
+                                            (self.agent_loc_space,
+                                             self.agent_loc_space,
+                                             self.door_loc_space))
+                                        if inter_state_next_lin not in pr_inter_state_next:
+                                            pr_inter_state_next[
+                                                inter_state_next_lin] = pr_list[i] * pr_list[j]
+                                        else:
+                                            pr_inter_state_next[
+                                                inter_state_next_lin] += pr_list[i] * pr_list[j]
+
+                                for inter_state_next_lin in pr_inter_state_next:
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_next_lin] = pr_inter_state_next[inter_state_next_lin]
+
+                            # 3. The objective agent chooses to open the door at
+                            # its current cell.
+                            else:
+                                # 1) The objective agent is in a door-cell,
+                                # which means the no matter the subjective agent
+                                # moves along which direction, the environment
+                                # is sure to reset.
+                                if cell_other in [gold_cell, tiger_cell]:
+                                    for cell_self_next in self.agent_birth_space:
+                                        for cell_other_next in self.agent_birth_space:
+                                            # Case 1:
+                                            # The gold cell remains in the same
+                                            # location after the reset.
+                                            inter_state_next = np.array(
+                                                [cell_self_next,
+                                                 cell_other_next,
+                                                 gold_cell])
+                                            inter_state_next_lin = joint_to_lin(
+                                                inter_state_next,
+                                                (self.agent_loc_space,
+                                                 self.agent_loc_space,
+                                                 self.door_loc_space))
+                                            trans_func_inter[
+                                                act_joint_lin][
+                                                inter_state_lin,
+                                                inter_state_next_lin] += \
+                                                1 / (num_agent_birthplace *
+                                                     num_agent_birthplace * 2)
+                                            # Case 2:
+                                            # The gold and tiger cell swap
+                                            # their locations after the reset.
+                                            inter_state_next = np.array(
+                                                [cell_self_next,
+                                                 cell_other_next, tiger_cell])
+                                            inter_state_next_lin = joint_to_lin(
+                                                inter_state_next,
+                                                (self.agent_loc_space,
+                                                 self.agent_loc_space,
+                                                 self.door_loc_space))
+                                            trans_func_inter[
+                                                act_joint_lin][
+                                                inter_state_lin,
+                                                inter_state_next_lin] += \
+                                                1 / (num_agent_birthplace *
+                                                     num_agent_birthplace * 2)
+
+                                # 2) The objective agent is not in a door-cell,
+                                # so its door-opening action has no impact to
+                                # the current environment.
+                                else:
+                                    cell_other_next = cell_other
+
+                                    # Case 1:
+                                    # 1. The objective agent moves along
+                                    # the intentional orientation.
+                                    inter_state_intent = np.array(
+                                        [cell_self_intent,
+                                         cell_other_next,
+                                         gold_cell])
+                                    inter_state_intent_lin = joint_to_lin(
+                                        inter_state_intent,
+                                        (self.agent_loc_space,
+                                         self.agent_loc_space,
+                                         self.door_loc_space))
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_intent_lin] += pr_trans_intent
+                                    # Case 2:
+                                    # The objective agent moves towards
+                                    # either side direction.
+                                    for cell in cell_self_side:
+                                        inter_state_side = np.array(
+                                            [cell, cell_other_next, gold_cell])
+                                        inter_state_side_lin = joint_to_lin(
+                                            inter_state_side,
+                                            (self.agent_loc_space,
+                                             self.agent_loc_space,
+                                             self.door_loc_space))
+                                        trans_func_inter[
+                                            act_joint_lin][
+                                            inter_state_lin,
+                                            inter_state_side_lin] += pr_trans_side
+
+        # 3.
+        act_self = self.action_space[-1]
+        for act_other in self.action_space:
+            act_joint = [act_self, act_other]
+            act_joint_lin = joint_to_lin(
+                act_joint, (self.action_space, self.action_space))
+            for gold_cell in self.door_loc_space:
+                # Inferring the cell where the tiger occupies according to
+                # the gold-cell.
+                idx_gold_in_space = np.argwhere(
+                    gold_cell == self.door_loc_space)[0][0]
+                idx_tiger_in_space = \
+                    num_door_birthplace - 1 - idx_gold_in_space
+                tiger_cell = self.door_loc_space[
+                    idx_tiger_in_space]
+
+                for cell_self in self.agent_loc_space:
+                    for cell_other in self.agent_loc_space:
+                        inter_state = np.array(
+                            [cell_self, cell_other, gold_cell])
+                        inter_state_lin = joint_to_lin(
+                            inter_state,
+                            (self.agent_loc_space,
+                             self.agent_loc_space,
+                             self.door_loc_space))
+
+                        # Case 1:
+                        # The subjective agent is in a door-cell. Once it opens
+                        # the door, the environment deterministically resets.
+                        if cell_self in [gold_cell, tiger_cell]:
+                            if cell_self == gold_cell:
+                                reward_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin, :] = reward_gold
+                            else:
+                                reward_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin, :] = reward_tiger
+
+                            for cell_self_next in self.agent_birth_space:
+                                for cell_other_next in self.agent_birth_space:
+                                    # i) The gold and the tiger remain in their
+                                    # original cells.
+                                    inter_state_next = np.array(
+                                        [cell_self_next,
+                                         cell_other_next,
+                                         gold_cell])
+                                    inter_state_next_lin = joint_to_lin(
+                                        inter_state_next,
+                                        (self.agent_loc_space,
+                                         self.agent_loc_space,
+                                         self.door_loc_space))
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_next_lin] += \
+                                        1 / (num_agent_birthplace *
+                                             num_agent_birthplace * 2)
+                                    # ii) The gold and tiger cell swap
+                                    # their locations after the reset.
+                                    inter_state_next = np.array(
+                                        [cell_self_next,
+                                         cell_other_next,
+                                         tiger_cell])
+                                    inter_state_next_lin = joint_to_lin(
+                                        inter_state_next,
+                                        (self.agent_loc_space,
+                                         self.agent_loc_space,
+                                         self.door_loc_space))
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_next_lin] += \
+                                        1 / (num_agent_birthplace *
+                                             num_agent_birthplace * 2)
+
+                        # Case 2:
+                        # The subjective agent is not in a door-cell, but it
+                        # tries to open the door. Therefore, only the objective
+                        # agent may impact the environment.
+                        else:
+                            reward_func_inter[
+                                act_joint_lin][
+                                inter_state_lin, :] = reward_wrong_open
+
+                            if act_other == self.action_space[0]:
+                                inter_state_next_lin = inter_state_lin
+                                trans_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin, inter_state_next_lin] = 1
+
+                            elif act_other in self.action_space[1:-1]:
+                                cell_self_next = cell_self
+                                cell_other_intent, cell_other_side = \
+                                    self.get_intent_side_cells(
+                                        move_action=act_other,
+                                        cell=cell_other)
+                                # i) The objective agent moves along
+                                # the intentional orientation.
+                                inter_state_intent = np.array(
+                                    [cell_self_next,
+                                     cell_other_intent,
+                                     gold_cell])
+                                inter_state_intent_lin = joint_to_lin(
+                                    inter_state_intent,
+                                    (self.agent_loc_space,
+                                     self.agent_loc_space,
+                                     self.door_loc_space))
+                                trans_func_inter[
+                                    act_joint_lin][
+                                    inter_state_lin,
+                                    inter_state_intent_lin] += pr_trans_intent
+                                # ii) The objective agent moves towards
+                                # either side direction.
+                                for cell in cell_other_side:
+                                    inter_state_side = np.array(
+                                        [cell_self_next, cell, gold_cell])
+                                    inter_state_side_lin = joint_to_lin(
+                                        inter_state_side,
+                                        (self.agent_loc_space,
+                                         self.agent_loc_space,
+                                         self.door_loc_space))
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin,
+                                        inter_state_side_lin] += pr_trans_side
+
+                            else:
+                                if cell_other in [gold_cell, tiger_cell]:
+                                    for cell_self_next in self.agent_birth_space:
+                                        for cell_other_next in self.agent_birth_space:
+                                            # i) The gold and the tiger remain
+                                            # in their original cells.
+                                            inter_state_next = np.array(
+                                                [cell_self_next,
+                                                 cell_other_next,
+                                                 gold_cell])
+                                            inter_state_next_lin = joint_to_lin(
+                                                inter_state_next,
+                                                (self.agent_loc_space,
+                                                 self.agent_loc_space,
+                                                 self.door_loc_space))
+                                            trans_func_inter[
+                                                act_joint_lin][
+                                                inter_state_lin,
+                                                inter_state_next_lin] += \
+                                                1 / (num_agent_birthplace *
+                                                     num_agent_birthplace * 2)
+                                            # ii) The gold and tiger cell swap
+                                            # their locations after the reset.
+                                            inter_state_next = np.array(
+                                                [cell_self_next,
+                                                 cell_other_next,
+                                                 tiger_cell])
+                                            inter_state_next_lin = joint_to_lin(
+                                                inter_state_next,
+                                                (self.agent_loc_space,
+                                                 self.agent_loc_space,
+                                                 self.door_loc_space))
+                                            trans_func_inter[
+                                                act_joint_lin][
+                                                inter_state_lin,
+                                                inter_state_next_lin] += \
+                                                1 / (num_agent_birthplace *
+                                                     num_agent_birthplace * 2)
+                                else:
+                                    inter_state_next_lin = inter_state_lin
+                                    trans_func_inter[
+                                        act_joint_lin][
+                                        inter_state_lin, inter_state_next_lin] = 1
+
+        # for a in np.arange(self.num_joint_action):
+        #     for s in np.arange(self.num_l0_phys_state):
+        #         if trans_func_l0[a][s, :].sum() != 1:
+        #             print("CASES IN LEVEL-0 TRANSITION FUNCTION:")
+        #             print(trans_func_inter[a][s, :])
+        #             print(trans_func_inter[a][s, :].sum())
+
+        # for a in np.arange(self.num_joint_action):
+        #     for s in np.arange(self.num_inter_phys_state):
+        #         if trans_func_inter[a][s, :].sum() != 1:
+        #             s_ = lin_to_joint(a, (self.agent_loc_space, self.agent_loc_space, self.door_loc_space))
+        #             print("CURRENT STATE", s_)
+        #             ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+        #             print("ACTION: i: %d, j:%d" % (ai, aj))
+        #             print("CASES IN INTERACTIVE TRANSITION FUNCTION:")
+        #             print(trans_func_inter[a][s, :])
+        #             print(trans_func_inter[a][s, :].sum())
+
+        if info_present is "export":
+            with open("./data/TR.txt", mode='w') as f:
+                f.write("LEVEL-0 TRANSITION FUNCTION")
+                for a in range(len(trans_func_l0)):
+                    ai, aj = lin_to_joint(a, (
+                    self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(trans_func_l0[a]))
+                f.write("-" * 10)
+                f.write("LEVEL-0 REWARD FUNCTION")
+                for a in range(len(reward_func_l0)):
+                    ai, aj = lin_to_joint(
+                        a, (self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(reward_func_l0[a]))
+                f.write("-" * 10)
+                f.write("INTERACTIVE TRANSITION FUNCTION")
+                for a in range(len(trans_func_inter)):
+                    ai, aj = lin_to_joint(
+                        a, (self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(trans_func_inter[a]))
+                f.write("-" * 10)
+                f.write("INTERACTIVE REWARD FUNCTION")
+                for a in range(len(reward_func_inter)):
+                    ai, aj = lin_to_joint(
+                        a, (self.action_space, self.action_space))
+                    f.write("\nACTION i: %d, ACTION j: %d\n" % (ai, aj))
+                    f.write(str(reward_func_inter[a]))
+        elif info_present is "console":
+            print("-" * 20)
+            print("LEVEL-0 TRANSITION FUNCTION")
+            for a in range(len(trans_func_l0)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(trans_func_l0[a])
+            print("-" * 10)
+            print("LEVEL-0 REWARD FUNCTION")
+            for a in range(len(reward_func_l0)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(reward_func_l0[a])
+            print("-" * 10)
+            print("INTERACTIVE TRANSITION FUNCTION")
+            for a in range(len(trans_func_inter)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(trans_func_inter[a])
+            print("-" * 10)
+            print("INTERACTIVE REWARD FUNCTION")
+            for a in range(len(reward_func_inter)):
+                ai, aj = lin_to_joint(a, (self.action_space, self.action_space))
+                print("ACTION i: %d, ACTION j: %d" % (ai, aj))
+                print(reward_func_inter[a])
+        else:
+            pass
+
+        return trans_func_l0, reward_func_l0, \
+               trans_func_inter, reward_func_inter
+
+    def transit(self, state, action, agent_level):
+        """
+
+        :param state:
+        :param action:
+        :param agent_level:
+        :return:
+        state_prime: next physical state (joint form)
+        state_prime_lin: next physical state (linear form)
+        reward: the reward an agent get when the action is applied at the state
+        """
         if np.ndim(state):
             state = joint_to_lin(
                 state, (self.agent_loc_space, self.door_loc_space))
@@ -649,32 +1630,118 @@ class TigerGridBase(object):
             action = joint_to_lin(
                 action, (self.action_space, self.action_space))
 
-        dist = self.obs_func[action, state, :]
-        obs = np.random.choice(self.obs_space, p=dist)
+        assert agent_level >= 0
+        if not agent_level:
+            dist = self.l0_trans_func[action][state, :].toarray()[0]
+            state_prime_lin = np.random.choice(
+                np.arange(self.num_l0_phys_state), p=dist)
+            state_prime = lin_to_joint(
+                state_prime_lin, (self.agent_loc_space, self.door_loc_space))
+            reward = self.l0_reward_func[action][state, state_prime_lin]
+        else:
+            dist = self.inter_trans_func[action][state, :].toarray()[0]
+            state_prime_lin = np.random.choice(
+                np.arange(self.num_inter_phys_state), p=dist)
+            state_prime = lin_to_joint(
+                state_prime_lin,
+                (self.agent_loc_space,
+                 self.agent_loc_space,
+                 self.door_loc_space))
+            reward = self.inter_reward_func[action][state, state_prime_lin]
+
+        return state_prime, state_prime_lin, reward
+
+    def observe(self, state, action, agent_level):
+        if not agent_level:
+            if np.ndim(state):
+                state = joint_to_lin(
+                    state, (self.agent_loc_space, self.door_loc_space))
+            if np.ndim(action):
+                action = joint_to_lin(
+                    action, (self.action_space, self.action_space))
+            dist = self.l0_obs_func[action, state, :]
+            obs = np.random.choice(self.obs_space, p=dist)
+
+        else:
+            if np.ndim(state):
+                state = joint_to_lin(
+                    state,
+                    (self.agent_loc_space,
+                     self.agent_loc_space,
+                     self.door_loc_space))
+            if np.ndim(action):
+                action = joint_to_lin(
+                    action, (self.action_space, self.action_space))
+            dist = self.inter_obs_func[action, state, :]
+            obs = np.random.choice(self.obs_space, p=dist)
 
         return obs
 
-    def apply_move(self, coord_in, move):
+    def get_intent_side_cells(self, move_action, cell):
+        # The agent moves towards the intentional direction and reaches its
+        # intentional next cell. The likelihood of the agent moves intentionally
+        # is pr_trans_intent.
+        move_intent = self.moves[move_action]
+        cell_intent = self.get_next_cell(move_intent, cell)
+
+        # The agent falsely moves towards either orthogonal direction of the
+        # intentional one and slides into one neighbor cell. The likelihood of
+        # the agent slides accidentally at the right angle of the intentional
+        # direction is evenly equal to (1 - pr_trans_intent) / 2.
+        move_side = [[int(np.logical_not(x)) if x else x + 1
+                      for x in move_intent],
+                     [int(np.logical_not(y)) if y else y - 1
+                      for y in move_intent]]
+        cell_side = list()
+        for move in move_side:
+            cell_side.append(self.get_next_cell(move, cell))
+
+        if len(cell_side) == 1:
+            cell_side = cell_side[0]
+
+        return cell_intent, cell_side
+
+    def get_next_cell(self, move, cell):
+        coord = np.array(self.cell_lin_to_bin(cell))
+        coord_next = self.apply_move(coord_in=coord, move=move)
+        if self.is_outofbound(coord_next):
+            coord_next = coord.copy()
+        cell_next = self.cell_bin_to_lin(coord_next)
+
+        return cell_next
+
+    @staticmethod
+    def apply_move(coord_in, move):
         coord = coord_in.copy()
         coord += move
-
         return coord
 
     def gen_door_cells(self):
+        # Randomly pick one cell from the door space.
         gold_cell = np.random.choice(self.params.door_loc_space)
-        gold_coord = self.cell_lin_to_bin(gold_cell)
-        tiger_coord = [gold_coord[0], self.M - 1 - gold_coord[1]]
-        tiger_cell = self.cell_bin_to_lin(tiger_coord)
+        # Obtain the index of the gold cell in the door_loc_space.
+        idx_gold_in_space = np.argwhere(
+            gold_cell == self.door_loc_space)[0][0]
+        # Infer the tiger cell according to the gold cell. In the Tiger-Grid
+        # domain, the tiger always appears on the diagonal of the gold within
+        # the top-right 4 cells.
+        idx_tiger_in_space = \
+            self.door_loc_space.shape[0] - 1 - idx_gold_in_space
+        # Index the tiger cell.
+        tiger_cell = self.door_loc_space[idx_tiger_in_space]
 
         return gold_cell, tiger_cell
 
     def gen_init_cells(self):
         return np.random.choice(
-            self.params.agent_birth_space, size=self.num_agent)
+            self.agent_birth_space, size=self.num_agent)
 
     def gen_init_belief(self):
+        num_agent_birthplace = self.agent_birth_space.shape[0]
+        num_door_loc_space = self.door_loc_space.shape[0]
+
         # level-0 initial belief over physical state space
-        b0 = np.zeros(self.phys_state_space.shape[0])
+        b0 = np.zeros(self.num_l0_phys_state)
         birth_indices = list()
 
         for i in self.agent_birth_space:
@@ -685,40 +1752,42 @@ class TigerGridBase(object):
         b0[birth_indices] = np.divide(1, len(birth_indices))
 
         # Initial belief over interactive state space
-        ib0 = np.zeros((self.phys_state_space.shape[0], 2), dtype='object')
+        ib0 = np.zeros((self.num_inter_phys_state, 2), dtype='object')
 
         for i in self.agent_loc_space:
-            for j in self.door_loc_space:
-                idx = joint_to_lin(
-                    [i, j], (self.agent_loc_space, self.door_loc_space))
-                ib0[idx][0] = np.concatenate([[idx], b0])
+            for j in self.agent_loc_space:
+                for k in self.door_loc_space:
+                    idx = joint_to_lin(
+                        [i, j, k],
+                        (self.agent_loc_space,
+                         self.agent_loc_space,
+                         self.door_loc_space))
+                    ib0[idx][0] = np.append(idx, b0)
 
         for i in self.agent_birth_space:
-            for j in self.door_loc_space:
-                idx = joint_to_lin(
-                    [i, j], (self.agent_loc_space, self.door_loc_space))
-                ib0[idx][1] = b0[idx]
+            for j in self.agent_birth_space:
+                for k in self.door_loc_space:
+                    idx = joint_to_lin(
+                        [i, j, k],
+                        (self.agent_loc_space,
+                         self.agent_loc_space,
+                         self.door_loc_space))
+                    ib0[idx][1] = np.divide(
+                        1, num_agent_birthplace * num_agent_birthplace * num_door_loc_space)
 
         return b0, ib0
 
     @staticmethod
     def gen_grid(grid_n, grid_m):
-        if grid_m % 2:
-            print("Currently the grid_m is required to be even.")
-        assert not grid_m % 2
-        # Initialize grid-world.
         grid = np.zeros([grid_n, grid_m])
-
         return grid
 
-    def is_outbound(self, coord_in):
-        assert len(coord_in) == 2
+    def is_outofbound(self, coord_in):
+        assert (np.array(coord_in).shape[0] == 2), "Only support 2D coordinates"
         if 0 <= coord_in[0] < self.N:
             if 0 <= coord_in[1] < self.M:
                 return False
-
             return True
-
         return True
 
     def obs_lin_to_bin(self, obs_lin):
@@ -729,6 +1798,7 @@ class TigerGridBase(object):
             obs = np.transpose(obs, [1, 0])
         return obs
 
+    @staticmethod
     def obs_bin_to_lin(self, obs_bin):
         return np.ravel_multi_index(obs_bin, [2, 2, 2, 2])
 
@@ -749,7 +1819,8 @@ class TigerGridBase(object):
         """
         grid_n = params.grid_n
         grid_m = params.grid_m
-        num_phys_state = params.num_phys_state
+        num_inter_phys_state = params.num_inter_phys_state
+        num_l0_phys_state = params.num_l0_phys_state
         if total_env_count is not None and traj_per_env is not None:
             total_traj_count = total_env_count * traj_per_env
         else:
@@ -768,6 +1839,12 @@ class TigerGridBase(object):
                          expectedrows=total_env_count)
 
         db.create_earray(where=db.root,
+                         name='terminals',
+                         atom=tables.Int32Atom(),
+                         shape=(0, grid_n, grid_m),
+                         expectedrows=total_traj_count)
+
+        db.create_earray(where=db.root,
                          name='expRs',
                          atom=tables.Float32Atom(),
                          shape=(0,),
@@ -780,9 +1857,15 @@ class TigerGridBase(object):
                          expectedrows=total_traj_count)
 
         db.create_earray(where=db.root,
-                         name='bs',
+                         name='inter_bs',
                          atom=tables.Float32Atom(),
-                         shape=(0, num_phys_state),
+                         shape=(0, num_inter_phys_state),
+                         expectedrows=total_traj_count)
+
+        db.create_earray(where=db.root,
+                         name='l0_bs',
+                         atom=tables.Float32Atom(),
+                         shape=(0, num_l0_phys_state),
                          expectedrows=total_traj_count)
 
         db.create_earray(where=db.root,
@@ -795,49 +1878,29 @@ class TigerGridBase(object):
                          name='samples',
                          atom=tables.Int32Atom(),
                          shape=(0, 5),
-                         # env_id, goal_state, step_id, traj_length, failed
+                         # env_id, terminals, step_id, traj_length, failed
                          expectedrows=total_traj_count)
         return db
 
-    def process_goals(self, goal_state):
+    def process_beliefs(self, b_self, b_other):
         """
-        :param goal_state: linear goal state
-        :return: goal image, same size as grid
+        :param b_self: belief of the subjective/modeling agent
+        :param b_other: belief of the objective/modeled agent
+        :return: belief reshaped to [batch_size, state_space_size]
         """
-        if goal_state.shape[0] >= 1:  # batch size
-            goal_grid = goal_state.copy()
-            goal_grid[np.nonzero(goal_state < 7)] //= 4
-            goal_grid[np.nonzero(goal_state >= 7)] = \
-                goal_grid[np.nonzero(goal_state >= 7)] // 4 + 1
-
+        batch = (b_other.shape[0] if b_other.ndim > 1 else 1)
+        print("Shape of b_self:", b_self.shape)
+        print("Shape of b_other:", b_other.shape)
+        if b_other.shape[0] == self.num_l0_phys_state:
+            b_other = b_other.reshape((batch, self.num_l0_phys_state))
         else:
-            print("Error: batch size < 1.")
-            assert False
+            assert b_other.shape[0] == self.num_inter_phys_state
+            b_other = b_other.reshape((batch, self.num_inter_phys_state))
 
-        goal_img = np.zeros([goal_grid.shape[0], self.N, self.M], 'i')
-        goal_idx = np.unravel_index(goal_grid, [self.N, self.M])
+        assert b_self.shape[0] == self.num_inter_phys_state
+        b_self = b_self.reshape((batch, self.num_inter_phys_state))
 
-        goal_img[
-            np.arange(goal_grid.shape[0]),
-            goal_idx[0],
-            goal_idx[1]
-        ] = 1
-
-        return goal_img
-
-    def process_beliefs(self, linear_belief):
-        """
-        :param linear_belief: belief in linear space
-        :return: belief reshaped to grid size
-        """
-        batch = (linear_belief.shape[0] if linear_belief.ndim > 1 else 1)
-        b = linear_belief.reshape(
-            [batch, self.params.num_phys_state]
-        )
-        if b.dtype != np.float:
-            return b.astype('f')
-
-        return b
+        return b_self.astype('f'), b_other.astype('f')
 
 
 def generate_grid_data(path,
@@ -849,6 +1912,7 @@ def generate_grid_data(path,
                        p_trans_intent,
                        p_obs_dir_corr,
                        p_obs_door_corr,
+                       agent_level,
                        num_env=10000,
                        traj_per_env=5):
     """
@@ -868,6 +1932,7 @@ def generate_grid_data(path,
     the gold-door correctly.
     :param p_obs_door_corr: probability that the agent observes that it has
     found the door cell correctly.
+    :param agent_level:
     """
 
     params = dotdict({
@@ -880,30 +1945,30 @@ def generate_grid_data(path,
         'num_door': num_gold + num_tiger,
 
         # configs for PF/I-PF
-        'num_particle_pf': 1000,
+        'num_particle_pf': 100,
 
         # state-related
         'agent_loc_space': np.arange(grid_n * grid_m),
         'agent_birth_space': np.arange(grid_n * grid_m)[-grid_m:],
-        'door_loc_space': np.arange(grid_n * grid_m)[:grid_m],
+        'door_loc_space': np.arange(grid_n * grid_m).reshape(grid_n, grid_m)[:2, -2:].reshape(4),
 
         # reward-related
-        'reward_gold': 10.0,
+        'reward_gold': 50.0,
         'reward_tiger': -100.0,
-        'reward_listen': -1.0,
-        'reward_wrong_open': -10.0,
-        'reward_move': 0,
+        'reward_listen': 0.0,
+        'reward_wrong_open': -1.0,
+        'reward_move': -1.0,
 
-        # self_action-related: stay, move-N, move-E, move-S, move-W,
+        # self_action-relate: stay, move-N, move-E, move-S, move-W,
         # open the door
         'action_space': np.arange(6),
-        'moves': [[0, 0], [1, 0], [0, 1], [-1, 0], [0, -1]],
+        'moves': [[0, 0], [-1, 0], [0, 1], [1, 0], [0, -1]],
         'init_action': 0,
 
         # observation-related: glitter-N, glitter-E, glitter-S, glitter-W,
         # door-found
         'obs_space': np.arange(5),
-        'observe_directions': [[0, 1], [1, 0], [0, -1], [-1, 0]],
+        'observe_directions': [[-1, 0], [0, 1], [1, 0], [0, -1]],
 
         # pomdp_function-related
         'pr_trans_intent': p_trans_intent,
@@ -911,21 +1976,29 @@ def generate_grid_data(path,
         'pr_obs_door_corr': p_obs_door_corr,
 
         'discount': 0.9,
+        'agent_level': agent_level
     })
-    params['phys_state_space'] = np.transpose(
-        [np.tile(params.agent_loc_space, len(params.door_loc_space)),
-         np.repeat(params.door_loc_space, len(params.agent_loc_space))])
-    # params['phys_state_space'] = np.transpose(  # common state space
-    #     [np.tile(params.phys_state_space, len(params.door_loc_space)),
-    #      np.repeat(params.door_loc_space, len(params.phys_state_space))])
-    params['num_phys_state'] = len(params['phys_state_space'])
-    params['num_action'] = len(params['action_space'])
-    params['num_joint_action'] = params['num_action'] ** 2
-    params['joint_action_space'] = np.transpose(
-        [np.tile(params['action_space'], params['num_action']),
-         np.repeat(params['action_space'], params['num_action'])])
-    params['num_obs'] = np.shape(params['obs_space'])[0]
-    params['traj_limit'] = 4 * (params['grid_n'] + params['grid_m'])  # reason?
+    # params.l0_phys_state_space is the physical state space for the level-0
+    # agent, where each of the state consists of the agent's own location and
+    # the location of the gold-door.
+    params['l0_phys_state_space'] = np.array(
+        [[x, y] for x in params.agent_loc_space for y in params.door_loc_space])
+    # params.inter_phys_state_space is the physical state space for the higher-
+    # level agent, including the other's locations as well
+    params['inter_phys_state_space'] = np.array(
+        [[x, y, z] for x in params.agent_loc_space
+         for y in params.agent_loc_space
+         for z in params.door_loc_space])
+    params['num_l0_phys_state'] = params.l0_phys_state_space.shape[0]
+    params['num_inter_phys_state'] = params.inter_phys_state_space.shape[0]
+
+    params['num_action'] = params.action_space.shape[0]
+    params['num_joint_action'] = params.num_action ** 2
+    params['joint_action_space'] = np.array(
+        [[x, y] for x in params.action_space for y in params.action_space])
+
+    params['num_obs'] = params.obs_space.shape[0]
+    params['traj_limit'] = 4 * (params.grid_n + params.grid_m)  # reason?
 
     # save params
     if not os.path.isdir(path):
@@ -933,7 +2006,6 @@ def generate_grid_data(path,
     pickle.dump(dict(params), open(path + "/params.pickle", 'wb'), -1)
 
     # randomize seeds, set to previous value to determine random numbers
-    np.random.seed()
     random.seed()
 
     # grid domain object
@@ -948,7 +2020,8 @@ def generate_grid_data(path,
     for env_i in range(num_env):
         print("Generating env %d with %d trajectories "
               % (env_i, traj_per_env))
-        domain.generate_trajectories(db, num_traj=traj_per_env)
+        domain.generate_trajectories(
+            db, num_traj=traj_per_env, level=agent_level)
 
     print("Done.")
 
@@ -972,12 +2045,12 @@ def main():
     parser.add_argument(
         '--N',
         type=int,
-        default=4,
+        default=3,
         help='The height of the grid world.')
     parser.add_argument(
         '--M',
         type=int,
-        default=4,
+        default=3,
         help='The width of the grid world.')
     parser.add_argument(
         '--agent',
@@ -1002,7 +2075,7 @@ def main():
     parser.add_argument(
         '--p_obs_dir_corr',
         type=float,
-        default=0.85,
+        default=0.9,
         help='The probability that the agent receives the correct observation'
              'of the direction of the door when it is not in a door-cell.')
     parser.add_argument(
@@ -1011,6 +2084,12 @@ def main():
         default=1.0,
         help='The probability that the agent receives the correct observation'
              'when it occupies a door-cell.')
+    parser.add_argument(
+        '--agent_level',
+        type=int,
+        default=1,
+        help='The nested level of the subjective/modeling agent in the I-POMDP '
+             'framework.')
     parser.add_argument(
         '--train_trajs',
         type=int,
@@ -1038,6 +2117,7 @@ def main():
                        p_trans_intent=args.p_trans_intent,
                        p_obs_dir_corr=args.p_obs_dir_corr,
                        p_obs_door_corr=args.p_obs_door_corr,
+                       agent_level=args.agent_level,
                        num_env=args.train,
                        traj_per_env=args.train_trajs)
 
@@ -1050,6 +2130,7 @@ def main():
                        p_trans_intent=args.p_trans_intent,
                        p_obs_dir_corr=args.p_obs_dir_corr,
                        p_obs_door_corr=args.p_obs_door_corr,
+                       agent_level=args.agent_level,
                        num_env=args.test,
                        traj_per_env=args.test_trajs)
 
