@@ -232,16 +232,16 @@ def run_eval(params, model_file):
     network_results = list()
     for eval_i in range(params.eval_samples):
         res = eval_iterator.__next__()
-        expert_results.append(res[:1])  # reward_sum
+        expert_results.append(res[:1])
         network_results.append(res[1:])
 
     def print_results(results):
         results = np.concatenate(results, axis=0)
         succ = results[:, 0]
         traj_len = results[succ > 0, 1]
-        reward = results[:, 0]
-        print("Success rate: %.3f  Trajectory length: %.1f" % (
-            np.mean(succ), np.mean(traj_len)))
+        reward_sum = results[succ > 0, 2]
+        print("Success rate: %.3f  Trajectory length: %.1f Reward: %.1f" % (
+            np.mean(succ), np.mean(traj_len), np.mean(reward_sum)))
     print("Expert")
     print_results(expert_results)
     print("IPOMDP-Net++")
